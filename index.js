@@ -1,0 +1,1436 @@
+/**
+ * dsh-wechat-bridge —— 让 DSH 自动接入微信的 Host 插件。
+ *
+ * 组成：
+ *   1. 入站网关：在 Host 的 webServer 上注册一个 webhook 路由，接收微信侧推送
+ *      （通用 JSON 网关 / 微信公众平台「服务器配置」XML + 签名校验）。
+ *   2. 出站网关：按配置把回复投递回微信（generic HTTP / official-account 客服消息 /
+ *      wecom 群机器人）。
+ *   3. 工具面：注册一组 wechat_* 工具，agent 自己决定看消息、回消息、记记忆。
+ *   4. 自动回复：每个微信会话映射到一个独立的 DSH Agent Session（可用 preset 注入人格），
+ *      收到消息→唤醒 agent→结束时把最终回复按 replyMode 原样/加前缀投递回微信。
+ *   5. 人格：persona.file 指向一个 markdown，激活时读取并作为系统提示词前缀注入。
+ *
+ * 设计约束（与 harness 插件规范一致）：
+ *   - 只注册、不扫描：所有副作用都在 apply 内用 ctx.effect / ctx.on 注册并返回清理器。
+ *   - 不引入 @deepseek-ai/* 运行时依赖，纯 ctx 服务 + Node 内置模块，避免 profile 里的解析问题。
+ *   - 状态（会话、消息、记忆）落在 stateFile，插件重载后仍在。
+ */
+
+import { createHash, randomUUID } from 'node:crypto'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { dirname, isAbsolute, join, resolve as resolvePath } from 'node:path'
+
+/** 插件行名。 */
+export const name = 'wechat-bridge'
+
+/** 硬依赖：工具注册表 + 系统提示词注册表。 */
+export const inject = ['tools', 'systemPrompt']
+
+const DEFAULT_STATE_DIR = join(homedir(), '.dsh', 'wechat-bridge')
+const MAX_BODY_BYTES = 1024 * 1024
+const TOKEN_REFRESH_MS = 7000 * 1000
+
+/** 配置默认值。用户配置按深合并覆盖。 */
+const DEFAULTS = {
+  enabled: true,
+  /** 入站/出站网关类型：generic（任意自建网关）| official（微信公众平台）。 */
+  kind: 'generic',
+  webhookPath: '/wechat/webhook',
+  gateway: {
+    /** generic：出站投递地址，POST JSON。 */
+    sendUrl: '',
+    /** generic：入站校验密钥（请求头 X-WeChat-Secret）；留空则不校验。 */
+    sharedSecret: '',
+    /** official：公众号凭据。 */
+    appId: '',
+    appSecret: '',
+    /** official：服务器配置里的 Token（签名校验用）。 */
+    token: '',
+    /** wecom：群机器人 webhook。 */
+    wecomWebhook: '',
+  },
+  reply: {
+    /** 自动回复总开关（关掉后仅保留工具面，由 agent 用工具主动回）。 */
+    autoReply: true,
+    /** raw=模型最终文本原样发出；formatted=加 prefix/suffix。 */
+    mode: 'raw',
+    prefix: '',
+    suffix: '',
+    /** 每个会话使用的 agent preset（人格 md 由该 preset 注入）。 */
+    agentPreset: 'wechat-agent',
+    /** preset 解析失败时的回落 preset；留空=直接失败并记 lastError。 */
+    fallbackPreset: '',
+    /** 模型路由；留空用默认模型。 */
+    provider: '',
+    model: '',
+    /** 权限 preset；留空用默认。 */
+    permissionPreset: '',
+    /** 工作目录；留空用进程 cwd。 */
+    workingDirectory: '',
+    /** 只接受这些会话（wxid / 群 id）；空数组=不限制。 */
+    allowedChatIds: [],
+    /** 机器人在群里的名字，用于判断是否被 @。 */
+    selfNames: [],
+    /** 单条回复最大字符数（企业微信/公众号文本都有上限）。 */
+    maxReplyChars: 1800,
+    /** 超长时的截断后缀。 */
+    truncateSuffix: '…（略）',
+    /** agent 出错时的兜底文案，留空则不发。 */
+    fallbackText: '',
+    /** agent 空闲多久后回收会话（毫秒），0=不回收。 */
+    idleSessionMs: 30 * 60 * 1000,
+  },
+  persona: {
+    /** 人格 markdown 路径（相对路径按插件目录解析）。 */
+    file: './persona/wechat-persona.md',
+    /** 是否注入人格 md 到系统提示词。自动回复会话通常由 preset 注入，故默认关闭以免重复。 */
+    inject: false,
+    /** sessions=只注入本插件托管的微信会话；all=在插件 ctx 全局注册（影响全部会话）。 */
+    scope: 'sessions',
+  },
+  history: {
+    /** 每个会话保留的最近消息条数。 */
+    maxMessages: 200,
+  },
+  /** 状态文件；留空= ~/.dsh/wechat-bridge/state.json。 */
+  stateFile: '',
+  /** 调试日志。 */
+  debug: false,
+}
+
+/** 把用户配置深合并到默认值上。 */
+function withDefaults(config) {
+  const merge = (base, over) => {
+    if (over === null || over === undefined) return base
+    if (Array.isArray(base) || Array.isArray(over)) return over
+    if (typeof base !== 'object' || typeof over !== 'object') return over
+    const out = { ...base }
+    for (const [key, value] of Object.entries(over)) out[key] = merge(base[key], value)
+    return out
+  }
+  return merge(DEFAULTS, config ?? {})
+}
+
+/**
+ * 把作者 DSL（property 级 `required: true`）编译成 harness 强制子集要求的 JSON Schema
+ * （object 级 `required: [...]` 数组）。工具参数用作者 DSL 由 registry 编译，
+ * 而 output.schema 是裸 JSON Schema，必须自己转。
+ */
+function compileSchema(node) {
+  if (Array.isArray(node)) return node.map(compileSchema)
+  if (node === null || typeof node !== 'object') return node
+  const out = {}
+  for (const [key, value] of Object.entries(node)) {
+    if (key === 'required' && value === true) continue
+    if (key === 'properties' && value && typeof value === 'object' && !Array.isArray(value)) {
+      const properties = {}
+      const required = []
+      for (const [prop, spec] of Object.entries(value)) {
+        properties[prop] = compileSchema(spec)
+        if (spec && spec.required === true) required.push(prop)
+      }
+      out.properties = properties
+      if (required.length > 0) out.required = required
+      continue
+    }
+    out[key] = compileSchema(value)
+  }
+  return out
+}
+
+/** 把作者 DSL 的参数表编译成 registry 期望的 JSON Schema（object-rooted）。 */
+function compileParameters(spec) {
+  const properties = {}
+  const required = []
+  for (const [key, value] of Object.entries(spec ?? {})) {
+    properties[key] = compileSchema(value)
+    if (value && value.required === true) required.push(key)
+  }
+  return { type: 'object', properties, ...(required.length > 0 ? { required } : {}) }
+}
+
+/** 丢掉值为 undefined 的键：会话日志只接受 lossless JSON。 */
+function withoutUndefined(record) {
+  const out = {}
+  for (const [key, value] of Object.entries(record)) if (value !== undefined) out[key] = value
+  return out
+}
+
+/** 从 ContentBlock[] 里抽出纯文本。 */
+function blocksToText(content) {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  const parts = []
+  for (const block of content) {
+    if (!block || typeof block !== 'object') continue
+    if (block.type === 'text' && typeof block.text === 'string') parts.push(block.text)
+  }
+  return parts.join('')
+}
+
+/** 深冻结一份 message，避免下游把它当成可变的、未规范化的输入。 */
+function deepFreeze(value) {
+  if (value && typeof value === 'object') {
+    for (const key of Object.keys(value)) deepFreeze(value[key])
+    Object.freeze(value)
+  }
+  return value
+}
+
+/**
+ * 构造一条合法的 UserMessage。
+ * 与 @deepseek-ai/dsh-llm 的 createUserMessage 等价：structuredClone 一份再深冻结，
+ * id 是随机 UUID。手写对象也能用，但下游对“已识别且不可变”的消息假设更安全。
+ */
+function userMessage(text) {
+  return deepFreeze(structuredClone({
+    id: randomUUID(),
+    role: 'user',
+    content: [{ type: 'text', text }],
+    source: { kind: 'user' },
+  }))
+}
+
+/** 幂等 mkdir。 */
+function ensureDir(dir) {
+  if (!dir || existsSync(dir)) return
+  mkdirSync(dir, { recursive: true })
+}
+
+/** 读取 JSON 文件，失败返回 undefined。 */
+function readJson(file) {
+  try {
+    return JSON.parse(readFileSync(file, 'utf8'))
+  } catch {
+    return undefined
+  }
+}
+
+/** XML 单标签取值（微信推送的 CDATA 形式）。 */
+function xmlValue(xml, tag) {
+  const cdata = new RegExp(`<${tag}><!\\[CDATA\\[([\\s\\S]*?)\\]\\]></${tag}>`).exec(xml)
+  if (cdata) return cdata[1]
+  const plain = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`).exec(xml)
+  return plain ? plain[1] : ''
+}
+
+/** 读请求体（带上限）。 */
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = []
+    let size = 0
+    req.on('data', (chunk) => {
+      size += chunk.length
+      if (size > MAX_BODY_BYTES) {
+        reject(new Error('request body too large'))
+        req.destroy()
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')))
+    req.on('error', reject)
+  })
+}
+
+/** 回一个 JSON 响应。 */
+function sendJson(res, status, body) {
+  if (res.writableEnded) return
+  res.statusCode = status
+  res.setHeader('content-type', 'application/json; charset=utf-8')
+  res.end(JSON.stringify(body))
+}
+
+/** 回一个纯文本响应。 */
+function sendText(res, status, text) {
+  if (res.writableEnded) return
+  res.statusCode = status
+  res.setHeader('content-type', 'text/plain; charset=utf-8')
+  res.end(text)
+}
+
+/**
+ * 注入 Host。
+ * @param {import('@deepseek-ai/cordis').Context} ctx 插件上下文。
+ * @param {object} config 插件行配置。
+ */
+export function apply(ctx, config) {
+  const cfg = withDefaults(config)
+  const log = (level, message) => {
+    const logger = ctx.logger
+    if (logger && typeof logger[level] === 'function') logger[level](`wechat-bridge: ${message}`)
+    else if (level === 'error') console.error(`wechat-bridge: ${message}`)
+  }
+  const debug = (message) => {
+    if (cfg.debug) log('info', message)
+  }
+  /** 记下最近一次失败，并通过 /status 与 wechat_status 暴露，便于没有日志时定位。 */
+  const recordError = (phase, error) => {
+    const message = String(error?.message ?? error)
+    state.lastError = { at: Date.now(), phase, message: message.slice(0, 400) }
+    state.counters.errors += 1
+    log('warn', `${phase}: ${message}`)
+  }
+
+  const pluginRoot = dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'))
+
+  // ── 状态 ────────────────────────────────────────────────────────────────
+  const stateFile = cfg.stateFile
+    ? (isAbsolute(cfg.stateFile) ? cfg.stateFile : resolvePath(process.cwd(), cfg.stateFile))
+    : join(DEFAULT_STATE_DIR, 'state.json')
+
+  const state = {
+    chats: new Map(),       // chatId -> { chatId, name, kind, readThrough, members: [] }
+    messages: new Map(),    // chatId -> Message[]
+    memory: { topics: [], thoughts: [], impressions: [] },
+    sessions: new Map(),    // chatId -> sessionId
+    seq: 0,
+    startedAt: Date.now(),
+    counters: { inbound: 0, outbound: 0, replies: 0, errors: 0 },
+    lastError: null,
+  }
+
+  const restore = readJson(stateFile)
+  if (restore && typeof restore === 'object') {
+    try {
+      for (const chat of restore.chats ?? []) state.chats.set(chat.chatId, chat)
+      for (const [chatId, list] of Object.entries(restore.messages ?? {})) state.messages.set(chatId, list)
+      for (const [chatId, sessionId] of Object.entries(restore.sessions ?? {})) state.sessions.set(chatId, sessionId)
+      if (restore.memory && typeof restore.memory === 'object') state.memory = { ...state.memory, ...restore.memory }
+      if (restore.lastError && typeof restore.lastError === 'object') state.lastError = restore.lastError
+      state.seq = Number.isSafeInteger(restore.seq) ? restore.seq : 0
+    } catch (error) {
+      log('warn', `state restore failed: ${error?.message ?? error}`)
+    }
+  }
+
+  let persistTimer
+  const persist = () => {
+    if (persistTimer) return
+    persistTimer = setTimeout(() => {
+      persistTimer = undefined
+      try {
+        ensureDir(dirname(stateFile))
+        writeFileSync(stateFile, JSON.stringify({
+          seq: state.seq,
+          chats: [...state.chats.values()],
+          messages: Object.fromEntries(state.messages),
+          sessions: Object.fromEntries(state.sessions),
+          memory: state.memory,
+          lastError: state.lastError,
+        }, null, 0))
+      } catch (error) {
+        log('warn', `state persist failed: ${error?.message ?? error}`)
+      }
+    }, 250)
+    if (typeof persistTimer.unref === 'function') persistTimer.unref()
+  }
+
+  // ── 人格 ────────────────────────────────────────────────────────────────
+  let personaText = ''
+  if (cfg.persona.file) {
+    const file = isAbsolute(cfg.persona.file) ? cfg.persona.file : join(pluginRoot, cfg.persona.file)
+    try {
+      personaText = readFileSync(file, 'utf8').trim()
+    } catch (error) {
+      log('warn', `persona file unreadable (${file}): ${error?.message ?? error}`)
+    }
+  }
+
+  /**
+   * 把人格 md 注入到一个 agent 作用域的系统提示词。
+   * 默认只注入本插件托管的微信会话；`persona.scope: 'all'` 才在插件 ctx 上全局注册
+   * （那会影响 profile 里所有会话，除非你确实想这样）。
+   */
+  const injectPersona = (targetCtx) => {
+    if (!cfg.persona.inject || !personaText) return () => {}
+    return targetCtx.systemPrompt.section({
+      name: 'wechat-bridge/persona',
+      order: targetCtx.systemPrompt.getSectionOrder('DEPLOYMENT_PERSONA_PREFIX'),
+      text: personaText,
+      interpolate: false,
+    })
+  }
+
+  if (cfg.persona.inject && cfg.persona.scope === 'all' && personaText) {
+    ctx.effect(() => injectPersona(ctx), 'wechat-bridge.persona()')
+    debug(`persona injected globally (${personaText.length} chars)`)
+  }
+
+  // ── 消息存取 ────────────────────────────────────────────────────────────
+  const chatOf = (chatId, patch) => {
+    let chat = state.chats.get(chatId)
+    if (!chat) {
+      chat = { chatId, name: chatId, kind: 'private', readThrough: 0, members: [] }
+      state.chats.set(chatId, chat)
+    }
+    if (patch) Object.assign(chat, patch)
+    return chat
+  }
+
+  const messagesOf = (chatId) => {
+    let list = state.messages.get(chatId)
+    if (!list) {
+      list = []
+      state.messages.set(chatId, list)
+    }
+    return list
+  }
+
+  const pushMessage = (chatId, message) => {
+    const list = messagesOf(chatId)
+    state.seq += 1
+    const record = withoutUndefined({
+      ...message,
+      chatId,
+      seq: state.seq,
+      time: message.time ?? Date.now(),
+    })
+    list.push(record)
+    const limit = Math.max(20, Number(cfg.history.maxMessages) || 200)
+    if (list.length > limit) list.splice(0, list.length - limit)
+    chatOf(chatId, { lastAt: record.time })
+    persist()
+    return record
+  }
+
+  const unreadOf = (chatId) => {
+    const chat = chatOf(chatId)
+    return messagesOf(chatId).filter((m) => m.seq > (chat.readThrough ?? 0) && m.direction === 'in')
+  }
+
+  // ── 出站投递 ────────────────────────────────────────────────────────────
+  let tokenCache = { value: '', expiresAt: 0 }
+
+  const officialToken = async () => {
+    if (tokenCache.value && Date.now() < tokenCache.expiresAt) return tokenCache.value
+    const url = `https://api.weixin.qq.com/cgi-bin/token?grant_type=client_credential&appid=${encodeURIComponent(cfg.gateway.appId)}&secret=${encodeURIComponent(cfg.gateway.appSecret)}`
+    const response = await fetch(url)
+    const payload = await response.json()
+    if (!payload?.access_token) throw new Error(`official token failed: ${JSON.stringify(payload)}`)
+    tokenCache = { value: payload.access_token, expiresAt: Date.now() + TOKEN_REFRESH_MS }
+    return payload.access_token
+  }
+
+  /**
+   * 把一条文本投递到微信侧。
+   * @returns {Promise<{ ok: boolean, detail: string }>}
+   */
+  const deliver = async (chatId, text, meta = {}) => {
+    if (!text) return { ok: false, detail: 'empty text' }
+    const body = String(text).slice(0, Math.max(1, Number(cfg.reply.maxReplyChars) || 1800))
+    try {
+      if (cfg.kind === 'official') {
+        const token = await officialToken()
+        const response = await fetch(`https://api.weixin.qq.com/cgi-bin/message/custom/send?access_token=${encodeURIComponent(token)}`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ touser: chatId, msgtype: 'text', text: { content: body } }),
+        })
+        const payload = await response.json().catch(() => ({}))
+        const ok = payload?.errcode === 0
+        if (!ok) log('warn', `official send rejected: ${JSON.stringify(payload)}`)
+        return { ok, detail: ok ? 'sent' : JSON.stringify(payload) }
+      }
+      if (cfg.kind === 'wecom') {
+        const response = await fetch(cfg.gateway.wecomWebhook, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ msgtype: 'text', text: { content: body } }),
+        })
+        const payload = await response.json().catch(() => ({}))
+        const ok = payload?.errcode === 0
+        return { ok, detail: ok ? 'sent' : JSON.stringify(payload) }
+      }
+      // generic：交给外部网关
+      if (!cfg.gateway.sendUrl) return { ok: false, detail: 'gateway.sendUrl is not configured' }
+      const headers = { 'content-type': 'application/json' }
+      if (cfg.gateway.sharedSecret) headers['x-wechat-secret'] = cfg.gateway.sharedSecret
+      const response = await fetch(cfg.gateway.sendUrl, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          action: 'send',
+          chatId,
+          text: body,
+          replyToMessageId: meta.replyToMessageId,
+          atUserId: meta.atUserId,
+          raw: cfg.reply.mode === 'raw',
+        }),
+      })
+      const detail = await response.text().catch(() => '')
+      return { ok: response.ok, detail: response.ok ? 'sent' : detail.slice(0, 300) }
+    } catch (error) {
+      state.counters.errors += 1
+      log('warn', `deliver failed: ${error?.message ?? error}`)
+      return { ok: false, detail: String(error?.message ?? error) }
+    }
+  }
+
+  const replyText = (text) => {
+    if (cfg.reply.mode === 'raw') return text
+    return `${cfg.reply.prefix ?? ''}${text}${cfg.reply.suffix ?? ''}`
+  }
+
+  // ── 自动回复：微信会话 → DSH agent session ──────────────────────────────
+  const relays = new Map()   // sessionId -> { chatId, turn, text, toolSent, pending, lastActive }
+  let agentApi          // { ctx, agents, agentPresets, ... } 由可选注入填充
+  let autoReplyOff = !cfg.reply.autoReply
+
+  const resolveModel = (api) => {
+    if (cfg.reply.provider && cfg.reply.model) {
+      return { provider: cfg.reply.provider, model: cfg.reply.model }
+    }
+    const current = api?.agentDefaultModel?.currentSelection?.()
+    return current ? { provider: current.provider, model: current.model } : { provider: '', model: '' }
+  }
+
+  /** 结束一个 turn 时把最终文本投递回微信。 */
+  const flushTurn = async (sessionId) => {
+    const relay = relays.get(sessionId)
+    if (!relay) return
+    relay.lastActive = Date.now()
+    if (relay.toolSent || autoReplyOff) {
+      relay.text = ''
+      return
+    }
+    const raw = (relay.text ?? '').trim()
+    relay.text = ''
+    if (!raw) return
+    const text = raw.length > cfg.reply.maxReplyChars
+      ? raw.slice(0, Math.max(1, cfg.reply.maxReplyChars - (cfg.reply.truncateSuffix?.length ?? 0))) + (cfg.reply.truncateSuffix ?? '')
+      : raw
+    const outcome = await deliver(relay.chatId, replyText(text))
+    if (outcome.ok) {
+      state.counters.replies += 1
+      state.counters.outbound += 1
+      pushMessage(relay.chatId, { direction: 'out', text, senderId: 'agent', senderName: 'agent' })
+    }
+  }
+
+  // 观测所有会话事件，按 sessionId 过滤出我们托管的会话。
+  ctx.effect(() => ctx.on('session/event', (session, event) => {
+    const sessionId = session?.header?.id ?? session?.id
+    const relay = relays.get(sessionId)
+    if (!relay) return
+    if (event.type === 'assistant/message') {
+      const text = blocksToText(event.data?.message?.content)
+      if (text && text.trim()) relay.text = text
+      if (Number.isSafeInteger(event.data?.turn)) relay.turn = event.data.turn
+      return
+    }
+    if (event.type === 'tool/result') {
+      const toolName = event.data?.message?.name ?? ''
+      if (typeof toolName === 'string' && toolName.startsWith('wechat_')) relay.toolSent = true
+      return
+    }
+    if (event.type === 'turn/start') {
+      relay.toolSent = false
+      relay.text = ''
+      relay.lastActive = Date.now()
+      return
+    }
+    if (event.type === 'turn/end') {
+      void flushTurn(sessionId)
+    }
+  }), 'wechat-bridge.sessionEvents()')
+
+  /** 为一个微信会话确保存在 agent session。 */
+  const ensureSession = async (chatId) => {
+    const api = agentApi
+    if (!api) throw new Error('agent services are not composed')
+    const existing = state.sessions.get(chatId)
+    if (existing) {
+      const live = api.agents.get?.(existing)
+      if (live) return { sessionId: existing, agent: live }
+      relays.delete(existing)
+      state.sessions.delete(chatId)
+    }
+    let preset
+    try {
+      preset = await api.agentPresets.resolve(cfg.reply.agentPreset || undefined)
+    } catch (error) {
+      recordError('agentPresets.resolve', error)
+      if (!cfg.reply.fallbackPreset) throw error
+      preset = await api.agentPresets.resolve(cfg.reply.fallbackPreset)
+    }
+    const scope = preset?.id ? await api.agentPresets.acquireScope(preset.id) : undefined
+    const sessionId = `wechat-${randomUUID()}`
+    const cwd = cfg.reply.workingDirectory || process.cwd()
+    const model = resolveModel(api)
+    const chat = chatOf(chatId)
+    relays.set(sessionId, { chatId, turn: 0, text: '', toolSent: false, lastActive: Date.now() })
+    try {
+      if (cfg.reply.permissionPreset && api.permissionPresets?.resolve) {
+        api.permissionPresets.resolve(cfg.reply.permissionPreset)
+      }
+      // 与 webhook 的实现保持同一顺序：先登记 workspace，让会话在 GUI 里可见、可 attach。
+      let workspace
+      if (api.workspaceRegistry?.create) {
+        try {
+          workspace = await api.workspaceRegistry.create(cwd)
+        } catch (error) {
+          debug(`workspace create failed: ${error?.message ?? error}`)
+        }
+      }
+      const handle = await api.agents.create({
+        sessionId,
+        meta: { cwd: workspace?.path ?? cwd, ...(preset?.id ? { agentPreset: preset.id } : {}) },
+        agentOptions: { ...model },
+        setup: async (agentCtx) => {
+          if (preset?.id) await api.agentPresets.mount(agentCtx, preset.id)
+          // 只在本次会话的作用域里注入人格，不污染 profile 里的其它会话
+          agentCtx.effect(() => injectPersona(agentCtx), 'wechat-bridge.sessionPersona()')
+        },
+      })
+      if (cfg.reply.permissionPreset && api.permissionPresets?.set) {
+        try { api.permissionPresets.set(handle.agent.session, cfg.reply.permissionPreset) } catch (error) { debug(`permission set failed: ${error?.message}`) }
+      }
+      if (workspace?.attachSession) {
+        try { await workspace.attachSession(sessionId) } catch (error) { debug(`attachSession failed: ${error?.message}`) }
+      }
+      if (api.sessionTitle?.rename) {
+        try { api.sessionTitle.rename(handle.agent.session, `微信 · ${chat.name || chatId}`) } catch (error) { debug(`title rename failed: ${error?.message}`) }
+      }
+      state.sessions.set(chatId, sessionId)
+      persist()
+      return { sessionId, agent: handle.agent }
+    } catch (error) {
+      relays.delete(sessionId)
+      throw error
+    } finally {
+      scope?.[Symbol.asyncDispose]?.().catch?.(() => {})
+    }
+  }
+
+  /** 入站消息 → agent 唤醒。 */
+  const handoff = async (chatId, text, meta) => {
+    if (autoReplyOff) return
+    if (!agentApi) {
+      debug('autoReply skipped: agent services unavailable')
+      return
+    }
+    const names = (cfg.reply.selfNames ?? []).filter(Boolean)
+    const chat = chatOf(chatId)
+    if (chat.kind === 'group' && names.length > 0) {
+      const mentioned = names.some((entry) => text.includes(`@${entry}`))
+      if (!mentioned) {
+        debug(`skip group message without @${names.join('/')}`)
+        return
+      }
+    }
+    try {
+      const { sessionId, agent } = await ensureSession(chatId)
+      const relay = relays.get(sessionId)
+      if (relay) relay.lastActive = Date.now()
+      const prompt = `[微信 ${chat.kind === 'group' ? '群聊' : '私聊'} · ${chat.name || chatId}]\n发送者：${meta.senderName || meta.senderId || '未知'}\n\n${text}`
+      try {
+        agent.followup(userMessage(prompt))
+      } catch (error) {
+        recordError(`followup(${chatId})`, error)
+        if (cfg.reply.fallbackText) void deliver(chatId, cfg.reply.fallbackText)
+      }
+    } catch (error) {
+      recordError(`handoff(${chatId})`, error)
+      if (cfg.reply.fallbackText) void deliver(chatId, cfg.reply.fallbackText)
+    }
+  }
+
+  /** 可选服务接线：agent 运行时。 */
+  ctx.inject(['agents', 'agentPresets'], (scoped) => {
+    agentApi = {
+      agents: scoped.agents,
+      agentPresets: scoped.agentPresets,
+      agentDefaultModel: scoped.get('agentDefaultModel'),
+      permissionPresets: scoped.get('permissionPresets'),
+      sessionTitle: scoped.get('sessionTitle'),
+      workspaceRegistry: scoped.get('workspaceRegistry'),
+    }
+    debug('agent services wired')
+  })
+
+  // ── 入站消息规范化 ──────────────────────────────────────────────────────
+  const ingest = (inbound) => {
+    const chatId = String(inbound.chatId ?? inbound.from ?? '').trim()
+    if (!chatId) return undefined
+    const allowed = (cfg.reply.allowedChatIds ?? []).filter(Boolean)
+    if (allowed.length > 0 && !allowed.includes(chatId)) {
+      debug(`rejected chat ${chatId} (not in allowedChatIds)`)
+      return undefined
+    }
+    const text = String(inbound.text ?? '').trim()
+    if (!text) return undefined
+    const chat = chatOf(chatId, {
+      name: String(inbound.chatName ?? inbound.name ?? chatId),
+      kind: inbound.kind === 'group' ? 'group' : (inbound.kind ?? 'private'),
+      ...(Array.isArray(inbound.members) ? { members: inbound.members } : {}),
+    })
+    const message = pushMessage(chatId, {
+      direction: 'in',
+      text,
+      senderId: String(inbound.senderId ?? inbound.sender ?? chatId),
+      senderName: String(inbound.senderName ?? inbound.sender ?? ''),
+      messageId: inbound.messageId ? String(inbound.messageId) : undefined,
+      time: Number.isSafeInteger(inbound.time) ? inbound.time : undefined,
+    })
+    state.counters.inbound += 1
+    return { chatId, chat, message, text }
+  }
+
+  const dispatchInbound = (inbound) => {
+    const accepted = ingest(inbound)
+    if (!accepted) return false
+    void handoff(accepted.chatId, accepted.text, {
+      senderId: accepted.message.senderId,
+      senderName: accepted.message.senderName,
+      messageId: accepted.message.messageId,
+    })
+    return true
+  }
+
+  // ── HTTP 路由 ───────────────────────────────────────────────────────────
+  const path = cfg.webhookPath.startsWith('/') ? cfg.webhookPath : `/${cfg.webhookPath}`
+
+  ctx.inject(['webServer'], (scoped) => {
+    const server = scoped.webServer
+    const STATUS_PATH = `${path}/status`
+
+    scoped.effect(() => server.register({
+      kind: 'exact',
+      path,
+      handler: async (req, res) => {
+        try {
+          const url = new URL(req.url ?? path, 'http://localhost')
+          if (req.method === 'GET') {
+            // 微信公众平台服务器配置：签名校验并回 echostr
+            const signature = url.searchParams.get('signature') ?? ''
+            const timestamp = url.searchParams.get('timestamp') ?? ''
+            const nonce = url.searchParams.get('nonce') ?? ''
+            const echostr = url.searchParams.get('echostr') ?? ''
+            if (cfg.kind === 'official' && cfg.gateway.token) {
+              const expected = createHash('sha1')
+                .update([cfg.gateway.token, timestamp, nonce].sort().join(''))
+                .digest('hex')
+              if (expected !== signature) return sendText(res, 403, 'bad signature')
+              return sendText(res, 200, echostr)
+            }
+            return sendJson(res, 200, { ok: true, path, kind: cfg.kind, chats: state.chats.size })
+          }
+
+          const body = await readBody(req)
+
+          if (cfg.kind === 'official') {
+            const signature = url.searchParams.get('signature') ?? ''
+            const timestamp = url.searchParams.get('timestamp') ?? ''
+            const nonce = url.searchParams.get('nonce') ?? ''
+            if (cfg.gateway.token) {
+              const expected = createHash('sha1')
+                .update([cfg.gateway.token, timestamp, nonce].sort().join(''))
+                .digest('hex')
+              if (expected !== signature) return sendText(res, 403, 'bad signature')
+            }
+            const messageType = xmlValue(body, 'MsgType')
+            const from = xmlValue(body, 'FromUserName')
+            const content = xmlValue(body, 'Content')
+            if (messageType === 'text' && from && content) {
+              dispatchInbound({
+                chatId: from,
+                text: content,
+                senderId: from,
+                senderName: xmlValue(body, 'FromUserName'),
+                messageId: xmlValue(body, 'MsgId'),
+                kind: 'private',
+              })
+            } else {
+              debug(`ignored official message type=${messageType || '?'}`)
+            }
+            // 公众号要求 5 秒内回 200；回复走客服消息接口异步发送。
+            return sendText(res, 200, 'success')
+          }
+
+          if (cfg.gateway.sharedSecret) {
+            const presented = req.headers['x-wechat-secret'] ?? ''
+            if (presented !== cfg.gateway.sharedSecret) return sendJson(res, 401, { ok: false, error: 'bad secret' })
+          }
+          let payload
+          try {
+            payload = JSON.parse(body)
+          } catch {
+            return sendJson(res, 400, { ok: false, error: 'invalid json' })
+          }
+          const message = payload.message ?? payload
+          const accepted = dispatchInbound({
+            chatId: message.chatId ?? message.from ?? message.roomId,
+            chatName: message.chatName ?? message.roomName ?? message.fromName,
+            kind: message.kind ?? (message.roomId ? 'group' : 'private'),
+            text: message.text ?? message.content,
+            senderId: message.senderId ?? message.from,
+            senderName: message.senderName ?? message.fromName,
+            messageId: message.messageId ?? message.id,
+            members: message.members,
+            time: message.time,
+          })
+          return sendJson(res, accepted ? 200 : 202, { ok: true, accepted })
+        } catch (error) {
+          state.counters.errors += 1
+          log('warn', `webhook failed: ${error?.message ?? error}`)
+          return sendJson(res, 500, { ok: false, error: String(error?.message ?? error) })
+        }
+      },
+    }), 'wechat-bridge.route()')
+
+    scoped.effect(() => server.register({
+      kind: 'exact',
+      path: STATUS_PATH,
+      handler: async (_req, res) => {
+        sendJson(res, 200, {
+          ok: true,
+          kind: cfg.kind,
+          enabled: cfg.enabled,
+          autoReply: !autoReplyOff,
+          gateway: {
+            sendUrl: cfg.gateway.sendUrl,
+            secretRequired: Boolean(cfg.gateway.sharedSecret),
+            appId: cfg.gateway.appId,
+            wecom: Boolean(cfg.gateway.wecomWebhook),
+          },
+          agentPreset: cfg.reply.agentPreset,
+          chats: [...state.chats.values()].map((chat) => ({
+            chatId: chat.chatId,
+            name: chat.name,
+            kind: chat.kind,
+            unread: unreadOf(chat.chatId).length,
+            sessionId: state.sessions.get(chat.chatId) ?? null,
+          })),
+          counters: state.counters,
+          lastError: state.lastError,
+          persona: { injected: Boolean(personaText), chars: personaText.length },
+        })
+      },
+    }), 'wechat-bridge.statusRoute()')
+
+    debug(`routes registered: ${path}`)
+  })
+
+  // ── 工具面 ──────────────────────────────────────────────────────────────
+  const MSG_SCHEMA = {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      seq: { type: 'integer', required: true },
+      chatId: { type: 'string', required: true },
+      direction: { type: 'string', required: true, enum: ['in', 'out'] },
+      text: { type: 'string', required: true },
+      senderId: { type: 'string' },
+      senderName: { type: 'string' },
+      messageId: { type: 'string' },
+      time: { type: 'integer' },
+    },
+  }
+  const MESSAGES_OUTPUT = {
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        ok: { type: 'boolean', required: true },
+        chatId: { type: 'string', required: true },
+        messages: { type: 'array', required: true, items: MSG_SCHEMA },
+        unreadCount: { type: 'integer', required: true },
+        readThroughSeq: { type: 'integer', required: true },
+      },
+    },
+    render: (_args, value) => [{
+      type: 'text',
+      text: value.messages.length === 0
+        ? `微信会话 ${value.chatId} 没有消息。`
+        : `微信会话 ${value.chatId}：${value.messages.length} 条（未读 ${value.unreadCount}，已读水位 ${value.readThroughSeq}）\n` +
+          value.messages.map((m) => `${m.direction === 'in' ? '←' : '→'} [${m.seq}] ${m.senderName || m.senderId || ''}: ${m.text}`).join('\n'),
+    }],
+  }
+
+  const register = (definition) => ctx.effect(() => ctx.tools.register({
+    ...definition,
+    parameters: compileParameters(definition.parameters),
+    output: { ...definition.output, schema: compileSchema(definition.output.schema) },
+  }), `wechat-bridge.tool(${definition.name})`)
+
+  register({
+    name: 'wechat_status',
+    description: '查看微信桥接状态：网关类型、路由、会话数、未读总数、计数器、人格是否已注入。',
+    parameters: {},
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true },
+          kind: { type: 'string', required: true },
+          autoReply: { type: 'boolean', required: true },
+          chats: { type: 'integer', required: true },
+          unread: { type: 'integer', required: true },
+          sessions: { type: 'integer', required: true },
+          personaChars: { type: 'integer', required: true },
+          inbound: { type: 'integer', required: true },
+          outbound: { type: 'integer', required: true },
+          errors: { type: 'integer', required: true },
+          lastError: { type: 'string' },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: `微信桥接：${value.kind}｜自动回复 ${value.autoReply ? '开' : '关'}｜会话 ${value.chats}｜未读 ${value.unread}｜人格 ${value.personaChars} 字｜入站 ${value.inbound} 出站 ${value.outbound} 错误 ${value.errors}`,
+      }],
+    },
+    execute: async () => {
+      let unread = 0
+      for (const chatId of state.chats.keys()) unread += unreadOf(chatId).length
+      return {
+        ok: true,
+        kind: cfg.kind,
+        autoReply: !autoReplyOff,
+        chats: state.chats.size,
+        unread,
+        sessions: state.sessions.size,
+        personaChars: personaText.length,
+        inbound: state.counters.inbound,
+        outbound: state.counters.outbound,
+        errors: state.counters.errors,
+        ...(state.lastError ? { lastError: `${state.lastError.phase}: ${state.lastError.message}` } : {}),
+      }
+    },
+  })
+
+  register({
+    name: 'wechat_list_chats',
+    description: '列出已知的微信会话（私聊/群），含未读数、最近消息时间与已托管的 agent 会话。',
+    parameters: {
+      limit: { type: 'integer', description: '最多返回多少个会话，默认 30，最大 100。' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true },
+          chats: {
+            type: 'array',
+            required: true,
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                chatId: { type: 'string', required: true },
+                name: { type: 'string', required: true },
+                kind: { type: 'string', required: true },
+                unread: { type: 'integer', required: true },
+                lastAt: { type: 'integer', required: true },
+                sessionId: { type: 'string' },
+              },
+            },
+          },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: value.chats.length === 0
+          ? '暂无微信会话记录。'
+          : value.chats.map((c) => `${c.kind === 'group' ? '群' : '私'} ${c.name}(${c.chatId}) 未读 ${c.unread}`).join('\n'),
+      }],
+    },
+    execute: async (args) => {
+      const limit = Math.min(100, Math.max(1, Number(args?.limit) || 30))
+      const chats = [...state.chats.values()]
+        .sort((a, b) => (b.lastAt ?? 0) - (a.lastAt ?? 0))
+        .slice(0, limit)
+        .map((chat) => ({
+          chatId: chat.chatId,
+          name: chat.name ?? chat.chatId,
+          kind: chat.kind ?? 'private',
+          unread: unreadOf(chat.chatId).length,
+          lastAt: chat.lastAt ?? 0,
+          ...(state.sessions.get(chat.chatId) ? { sessionId: state.sessions.get(chat.chatId) } : {}),
+        }))
+      return { ok: true, chats }
+    },
+  })
+
+  register({
+    name: 'wechat_get_unread_messages',
+    description: '读取某个微信会话的未读入站消息（不自动标记已读；读完用 wechat_mark_read 提交水位）。',
+    parameters: {
+      chatId: { type: 'string', required: true, description: '会话 id（wxid 或群 id）。' },
+      limit: { type: 'integer', description: '最多返回条数，默认 30，最大 100。' },
+    },
+    output: MESSAGES_OUTPUT,
+    execute: async (args) => {
+      const chatId = String(args?.chatId ?? '')
+      const chat = chatOf(chatId)
+      const unread = unreadOf(chatId)
+      const limit = Math.min(100, Math.max(1, Number(args?.limit) || 30))
+      return {
+        ok: true,
+        chatId,
+        messages: unread.slice(-limit),
+        unreadCount: unread.length,
+        readThroughSeq: chat.readThrough ?? 0,
+      }
+    },
+  })
+
+  register({
+    name: 'wechat_get_recent_messages',
+    description: '读取某个微信会话的最近消息（含自己发出的），用于补看历史与上下文。',
+    parameters: {
+      chatId: { type: 'string', required: true, description: '会话 id。' },
+      limit: { type: 'integer', description: '最多返回条数，默认 20，最大 100。' },
+    },
+    output: MESSAGES_OUTPUT,
+    execute: async (args) => {
+      const chatId = String(args?.chatId ?? '')
+      const chat = chatOf(chatId)
+      const limit = Math.min(100, Math.max(1, Number(args?.limit) || 20))
+      const all = messagesOf(chatId)
+      return {
+        ok: true,
+        chatId,
+        messages: all.slice(-limit),
+        unreadCount: unreadOf(chatId).length,
+        readThroughSeq: chat.readThrough ?? 0,
+      }
+    },
+  })
+
+  register({
+    name: 'wechat_send_message',
+    description: '向微信会话发送文本。message 发一条，messages 数组分多条按顺序发出（更自然）。发送成功后本条 turn 不会再自动转发模型输出。',
+    parameters: {
+      chatId: { type: 'string', required: true, description: '会话 id。' },
+      message: { type: 'string', description: '单条文本。' },
+      messages: { type: 'array', description: '多条文本，按顺序逐条发送。', items: { type: 'string' } },
+      replyToMessageId: { type: 'string', description: '要引用的入站消息 id（可选）。' },
+      atUserId: { type: 'string', description: '要 @ 的成员 id（群聊可选）。' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true },
+          chatId: { type: 'string', required: true },
+          sent: {
+            type: 'array',
+            required: true,
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                seq: { type: 'integer', required: true },
+                text: { type: 'string', required: true },
+                ok: { type: 'boolean', required: true },
+              },
+            },
+          },
+          detail: { type: 'string' },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: value.ok
+          ? `已向 ${value.chatId} 发送 ${value.sent.filter((s) => s.ok).length}/${value.sent.length} 条。`
+          : `发送失败：${value.detail ?? 'unknown'}`,
+      }],
+    },
+    execute: async (args, exec) => {
+      const chatId = String(args?.chatId ?? '')
+      const texts = []
+      if (typeof args?.message === 'string' && args.message.trim()) texts.push(args.message)
+      if (Array.isArray(args?.messages)) for (const item of args.messages) if (typeof item === 'string' && item.trim()) texts.push(item)
+      if (texts.length === 0) return { ok: false, chatId, sent: [], detail: 'no text to send' }
+      const sent = []
+      let detail = ''
+      let allOk = true
+      for (const text of texts) {
+        const outcome = await deliver(chatId, text, {
+          replyToMessageId: args?.replyToMessageId,
+          atUserId: args?.atUserId,
+        })
+        if (!outcome.ok) {
+          allOk = false
+          detail = outcome.detail
+        }
+        const record = pushMessage(chatId, {
+          direction: 'out',
+          text,
+          senderId: 'self',
+          senderName: 'self',
+        })
+        sent.push({ seq: record.seq, text, ok: outcome.ok })
+        state.counters.outbound += outcome.ok ? 1 : 0
+      }
+      // 让自动转发跳过本轮，避免重复
+      const sessionId = state.sessions.get(chatId)
+      const relay = sessionId ? relays.get(sessionId) : undefined
+      if (relay) relay.toolSent = true
+      const agentSession = exec?.agent?.id
+      if (!relay && agentSession) {
+        const own = relays.get(agentSession)
+        if (own) own.toolSent = true
+      }
+      return { ok: allOk, chatId, sent, detail }
+    },
+  })
+
+  register({
+    name: 'wechat_get_members',
+    description: '查看某个微信群成员（由网关推送的成员列表；未推送则只包含已知发言人）。',
+    parameters: {
+      chatId: { type: 'string', required: true, description: '群 id。' },
+      limit: { type: 'integer', description: '最多返回人数，默认 50。' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true },
+          chatId: { type: 'string', required: true },
+          members: {
+            type: 'array',
+            required: true,
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                userId: { type: 'string', required: true },
+                name: { type: 'string', required: true },
+              },
+            },
+          },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: value.members.length === 0
+          ? `${value.chatId} 没有成员信息（网关未推送成员列表）。`
+          : value.members.map((m) => `${m.name}(${m.userId})`).join('、'),
+      }],
+    },
+    execute: async (args) => {
+      const chatId = String(args?.chatId ?? '')
+      const chat = chatOf(chatId)
+      const limit = Math.min(200, Math.max(1, Number(args?.limit) || 50))
+      const seen = new Map()
+      for (const member of chat.members ?? []) {
+        if (member?.userId) seen.set(String(member.userId), String(member.name ?? member.userId))
+      }
+      for (const message of messagesOf(chatId)) {
+        if (message.direction !== 'in' || !message.senderId) continue
+        if (!seen.has(message.senderId)) seen.set(message.senderId, message.senderName || message.senderId)
+      }
+      return { ok: true, chatId, members: [...seen.entries()].slice(0, limit).map(([userId, name]) => ({ userId, name })) }
+    },
+  })
+
+  register({
+    name: 'wechat_mark_read',
+    description: '把某个微信会话标记为已读到指定水位（用未读/最近消息返回的 readThroughSeq 或消息 seq）。',
+    parameters: {
+      chatId: { type: 'string', required: true, description: '会话 id。' },
+      throughSeq: { type: 'integer', description: '已读水位；省略则读到该会话最新一条。' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true },
+          chatId: { type: 'string', required: true },
+          throughSeq: { type: 'integer', required: true },
+          unreadCount: { type: 'integer', required: true },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: `${value.chatId} 已读到 ${value.throughSeq}，剩余未读 ${value.unreadCount}。` }],
+    },
+    execute: async (args) => {
+      const chatId = String(args?.chatId ?? '')
+      const chat = chatOf(chatId)
+      const list = messagesOf(chatId)
+      const fallback = list.length > 0 ? list[list.length - 1].seq : 0
+      const throughSeq = Number.isSafeInteger(args?.throughSeq) ? Number(args.throughSeq) : fallback
+      chat.readThrough = Math.max(chat.readThrough ?? 0, throughSeq)
+      persist()
+      return { ok: true, chatId, throughSeq: chat.readThrough, unreadCount: unreadOf(chatId).length }
+    },
+  })
+
+  register({
+    name: 'wechat_memory_append',
+    description: '记录一条轻量记忆：进行中的话题（activeTopic）/想说未说的话（pendingThought）/对某人的印象（memberImpression）。',
+    parameters: {
+      category: { type: 'string', required: true, enum: ['activeTopic', 'pendingThought', 'memberImpression'], description: '记忆类别。' },
+      content: { type: 'string', required: true, description: '记忆内容。' },
+      target: { type: 'string', description: 'memberImpression 时的对象名字。' },
+      chatId: { type: 'string', description: '关联会话 id（可选）。' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true },
+          category: { type: 'string', required: true },
+          count: { type: 'integer', required: true },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: `已记录 ${value.category} 记忆，共 ${value.count} 条。` }],
+    },
+    execute: async (args) => {
+      const category = String(args?.category ?? '')
+      const bucket = category === 'pendingThought' ? state.memory.thoughts
+        : category === 'memberImpression' ? state.memory.impressions
+          : state.memory.topics
+      bucket.push({
+        id: randomUUID(),
+        content: String(args?.content ?? ''),
+        ...(args?.target ? { target: String(args.target) } : {}),
+        ...(args?.chatId ? { chatId: String(args.chatId) } : {}),
+        time: Date.now(),
+      })
+      if (bucket.length > 50) bucket.splice(0, bucket.length - 50)
+      persist()
+      return { ok: true, category, count: bucket.length }
+    },
+  })
+
+  register({
+    name: 'wechat_memory_query',
+    description: '查看当前记忆：话题、想说未说的话、成员印象。',
+    parameters: {
+      category: { type: 'string', enum: ['activeTopic', 'pendingThought', 'memberImpression'], description: '只看某一类。' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true },
+          entries: {
+            type: 'array',
+            required: true,
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                category: { type: 'string', required: true },
+                content: { type: 'string', required: true },
+                target: { type: 'string' },
+              },
+            },
+          },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: value.entries.length === 0
+          ? '暂无记忆。'
+          : value.entries.map((e) => `[${e.category}] ${e.content}${e.target ? `（${e.target}）` : ''}`).join('\n'),
+      }],
+    },
+    execute: async (args) => {
+      const wanted = args?.category
+      const entries = []
+      if (!wanted || wanted === 'activeTopic') for (const item of state.memory.topics) entries.push({ category: 'activeTopic', content: item.content })
+      if (!wanted || wanted === 'pendingThought') for (const item of state.memory.thoughts) entries.push({ category: 'pendingThought', content: item.content })
+      if (!wanted || wanted === 'memberImpression') {
+        for (const item of state.memory.impressions) {
+          entries.push({ category: 'memberImpression', content: item.content, ...(item.target ? { target: item.target } : {}) })
+        }
+      }
+      return { ok: true, entries }
+    },
+  })
+
+  register({
+    name: 'wechat_memory_remove',
+    description: '删除记忆：按内容匹配删话题/想法，按 target 删成员印象。',
+    parameters: {
+      category: { type: 'string', required: true, enum: ['activeTopic', 'pendingThought', 'memberImpression'], description: '记忆类别。' },
+      content: { type: 'string', description: '要删除的话题/想法原文。' },
+      target: { type: 'string', description: '要删除的成员印象对象。' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true },
+          removed: { type: 'integer', required: true },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: `已删除 ${value.removed} 条记忆。` }],
+    },
+    execute: async (args) => {
+      const category = String(args?.category ?? '')
+      let removed = 0
+      if (category === 'memberImpression') {
+        const target = String(args?.target ?? '')
+        const before = state.memory.impressions.length
+        state.memory.impressions = target
+          ? state.memory.impressions.filter((item) => item.target !== target)
+          : []
+        removed = before - state.memory.impressions.length
+      } else {
+        const bucket = category === 'pendingThought' ? state.memory.thoughts : state.memory.topics
+        const content = String(args?.content ?? '')
+        const before = bucket.length
+        const kept = content ? bucket.filter((item) => item.content !== content) : []
+        if (category === 'pendingThought') state.memory.thoughts = kept
+        else state.memory.topics = kept
+        removed = before - kept.length
+      }
+      persist()
+      return { ok: true, removed }
+    },
+  })
+
+
+  register({
+    name: 'wechat_diagnose',
+    description: '自检自动回复链路：用一个探针会话真正走一遍「建 agent 会话 → 投递消息」并回报失败原因（排查“会话建了但没起 turn”）。只建一个以 wechat-probe- 开头的会话，不影响真实微信会话。',
+    parameters: {
+      text: { type: 'string', description: '探针消息正文，默认一句自检话术。' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true },
+          agentServices: { type: 'boolean', required: true },
+          preset: { type: 'string', required: true },
+          sessionId: { type: 'string' },
+          error: { type: 'string' },
+          liveAgents: { type: 'integer', required: true },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: value.ok
+          ? `链路正常：agent 服务可用，preset=${value.preset}，探针会话 ${value.sessionId ?? '(已存在)'}，当前存活 agent ${value.liveAgents} 个。`
+          : `链路失败：agentServices=${value.agentServices} preset=${value.preset} session=${value.sessionId ?? '(无)'}\n错误：${value.error ?? 'unknown'}`,
+      }],
+    },
+    execute: async (args) => {
+      const chatId = `wechat-probe-${randomUUID().slice(0, 8)}`
+      const text = String(args?.text ?? '自检：确认链路可用，只回一句即可。')
+      let liveAgents = 0
+      try {
+        liveAgents = agentApi?.agents?.list?.().length ?? 0
+      } catch { /* ignore */ }
+      if (!agentApi) {
+        return { ok: false, agentServices: false, preset: cfg.reply.agentPreset, liveAgents, error: 'agents/agentPresets services are not composed in this profile' }
+      }
+      let sessionId
+      try {
+        const ensured = await ensureSession(chatId)
+        sessionId = ensured.sessionId
+        ensured.agent.followup(userMessage(text))
+        return { ok: true, agentServices: true, preset: cfg.reply.agentPreset, sessionId, liveAgents }
+      } catch (error) {
+        recordError('diagnose', error)
+        return { ok: false, agentServices: true, preset: cfg.reply.agentPreset, ...(sessionId ? { sessionId } : {}), liveAgents, error: String(error?.message ?? error).slice(0, 400) }
+      }
+    },
+  })
+
+  register({
+    name: 'wechat_get_prompt',
+    description: '查看当前微信桥接的人格提示词、网关配置摘要、可用工具与已知会话，用于进入角色或刷新状态。',
+    parameters: {},
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true },
+          persona: { type: 'string', required: true },
+          kind: { type: 'string', required: true },
+          autoReply: { type: 'boolean', required: true },
+          chats: { type: 'integer', required: true },
+          tools: { type: 'array', required: true, items: { type: 'string' } },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: `【人格】\n${value.persona || '（未注入人格 md）'}\n\n【网关】${value.kind}｜自动回复 ${value.autoReply ? '开' : '关'}｜会话 ${value.chats}\n【工具】${value.tools.join('、')}`,
+      }],
+    },
+    execute: async () => ({
+      ok: true,
+      persona: personaText,
+      kind: cfg.kind,
+      autoReply: !autoReplyOff,
+      chats: state.chats.size,
+      tools: ['wechat_status', 'wechat_diagnose', 'wechat_list_chats', 'wechat_get_unread_messages', 'wechat_get_recent_messages', 'wechat_send_message', 'wechat_get_members', 'wechat_mark_read', 'wechat_memory_append', 'wechat_memory_query', 'wechat_memory_remove', 'wechat_get_prompt'],
+    }),
+  })
+
+  // ── 人命令：/wechat on|off|status ──────────────────────────────────────
+  ctx.inject(['commands'], (scoped) => {
+    scoped.effect(() => scoped.commands.register({
+      name: 'wechat',
+      description: '微信桥接开关与状态：/wechat [on|off|status|reset]',
+      input: { hint: 'on | off | status | reset' },
+      async handler(invocation) {
+        const action = String(invocation?.rawInput ?? '').trim().toLowerCase()
+        if (action === 'on') {
+          autoReplyOff = false
+          return { kind: 'success', text: '微信自动回复已开启。' }
+        }
+        if (action === 'off') {
+          autoReplyOff = true
+          return { kind: 'success', text: '微信自动回复已关闭（工具面仍可用）。' }
+        }
+        if (action === 'reset') {
+          // 清掉本地缓存的会话/消息/记忆与会话映射；不会动真实的微信会话，也不会删 DSH 里已有的 session。
+          const chats = state.chats.size
+          state.chats.clear()
+          state.messages.clear()
+          state.sessions.clear()
+          state.memory = { topics: [], thoughts: [], impressions: [] }
+          state.lastError = null
+          relays.clear()
+          persist()
+          return { kind: 'success', text: `已清空本地微信缓存（${chats} 个会话）。` }
+        }
+        let unread = 0
+        for (const chatId of state.chats.keys()) unread += unreadOf(chatId).length
+        return {
+          kind: 'success',
+          text: `微信桥接 ${cfg.kind}｜自动回复 ${autoReplyOff ? '关' : '开'}｜会话 ${state.chats.size}｜未读 ${unread}｜会话池 ${state.sessions.size}`,
+        }
+      },
+    }), 'wechat-bridge.command()')
+  })
+
+  // ── 会话回收 ────────────────────────────────────────────────────────────
+  const idleMs = Number(cfg.reply.idleSessionMs) || 0
+  if (idleMs > 0 && typeof setInterval === 'function') {
+    const timer = setInterval(() => {
+      const now = Date.now()
+      for (const [sessionId, relay] of relays) {
+        if (now - (relay.lastActive ?? 0) < idleMs) continue
+        relays.delete(sessionId)
+        for (const [chatId, mapped] of state.sessions) if (mapped === sessionId) state.sessions.delete(chatId)
+      }
+      persist()
+    }, Math.min(idleMs, 60000))
+    if (typeof timer.unref === 'function') timer.unref()
+    ctx.effect(() => () => clearInterval(timer), 'wechat-bridge.idleTimer()')
+  }
+
+  persist()
+  debug(`activated: kind=${cfg.kind} path=${path} autoReply=${!autoReplyOff}`)
+}

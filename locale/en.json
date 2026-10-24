@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "WeChat Bridge",
+    "description": "Bridges WeChat into DSH: webhook gateway, wechat_* tools, and a per-chat auto-reply agent with an injectable persona markdown."
+  }
+}

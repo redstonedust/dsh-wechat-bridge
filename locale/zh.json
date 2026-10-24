@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "微信桥接",
+    "description": "把微信接进 DSH：webhook 网关 + wechat_* 工具 + 每会话自动回复 agent，人格 md 可注入。"
+  }
+}

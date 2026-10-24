@@ -1,2 +1,217 @@
 # dsh-wechat-bridge
-100%vibe coding的dsh桥接到微信的插件
+
+**100% vibe coding 的 DSH 桥接到微信的插件。**
+
+一个把微信接进 [DSH（DeepSeek Harness）](https://github.com/deepseek-ai/deepseek-harness) 的 Host 插件 + 一个配套 agent 模式。微信只当"嘴和耳朵"，脑子是 DSH 里的 agent。
+
+```
+       微信侧                       DSH Host（127.0.0.1:43120）
+ ┌──────────────┐   POST /wechat/webhook   ┌────────────────────────────┐
+ │ 公众号 /      │ ───────────────────────▶ │ wechat-bridge 插件          │
+ │ WeChatFerry / │   （JSON 或 XML+签名）    │  ├ 入站解析 → 会话/消息表    │
+ │ Gewechat /    │                          │  ├ autoReply? ──▶ Agent     │
+ │ 自建网关      │ ◀─────────────────────── │  │   （preset: wechat-agent）│
+ └──────────────┘   {action:"send",...}    │  └ turn/end → 原样投递      │
+                                           └────────────────────────────┘
+                                                     ▲  工具面 12 个
+                                                     │  wechat_send_message …
+                                              任意 agent 会话
+```
+
+## 它做什么
+
+- **接微信**：在 DSH 自己的 webServer 上开一个 webhook 端点，收网关推送、把回复投回去。支持 `generic`（任意自建网关）、`official`（公众号，含签名验签）、`wecom`（企微群机器人，只出站）。
+- **给 agent 一只手**：注册 12 个 `wechat_*` 工具（看消息、分条发、引用、@人、已读水位、轻量记忆、链路自检）。
+- **自动回复**：每个微信会话映射成一个独立 DSH 会话，跑 `wechat-agent` 模式（人格 markdown 注入），一轮结束把最终文本**原样**发回微信。
+- **两种输出模式**：没调发送工具 → 本轮最终文本原样转发；调了发送工具 → 文本只作思考（agent 自己控制发几条、发什么）。
+
+## 安装
+
+```powershell
+# 在 DSH 里（任意会话）让 agent 执行，或等效地用 plugin_manager：
+#   plugin_manager({ action: "install_bundle", target: "C:\path\to\dsh-wechat" })
+# 它会自己 pnpm 安装、把包写进 profile 的 dsh.profile.bundles、并应用 patch
+
+# 装完确认
+node scripts\check.ps1
+```
+
+也可以用你的终端手动确认两件事：
+
+- `plugin_manager list_plugins` 里 `include:wechat-bridge`、`include:preset-wechat-agent` 都是 `active`；
+- 设置 → Agent 预设里出现「微信远程 Agent」卡片。
+
+## 三个场景脚本
+
+场景对应 [使用说明书.md](使用说明书.md) 第 2 节，脚本在 `scripts/`，都是幂等的（配置写进 profile patch 的受管区块，重复跑只替换该区块）。
+
+```powershell
+# A. 本地跑通整条链路（不连真实微信）：起网关桩 → 推消息 → 等原样投递
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\scenario-a-local-gateway.ps1
+
+# B. 只当工具用：关掉自动转发，验证「消息只入库、不自动回」
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\scenario-b-tool-only.ps1
+
+# C. 接公众号：切 kind=official，本地验签自测 + （可选）XML 入站自测
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\scenario-c-official-account.ps1 `
+    -AppId wx1234567890abcdef -AppSecret <secret> -Token <token> `
+    -PublicUrl https://bot.example.com/wechat/webhook -TestInbound
+
+# 体检：语法 + 离线自检 + preset 一致性 + 线上状态
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\check.ps1
+```
+
+场景 A 的正常输出：
+
+```
+==> 推入站消息：只回三个字：链路通
+  OK  入站已接受：{"ok":true,"accepted":true}
+==> 等插件把回复投递到网关桩（最多 150 秒）
+  OK  收到 1 条投递
+
+收到的投递（最后一条）：
+  2026-10-24T17:00:06.238Z /send {"action":"send","chatId":"wxid_demo","text":"链路通","raw":true}
+
+解析：
+  action = send
+  chatId = wxid_demo
+  raw    = True   （true = 模型最终文本原样发出）
+  text   = 链路通
+
+  OK  场景 A 通过：入站 → agent → 原样出站 已闭环
+```
+
+> 每个脚本都支持 `-WhatIf`：只打印会写进 profile patch 的配置，不动文件。
+
+## 配置
+
+配置写在 profile 的 `cordis.patch.yml`（`%USERPROFILE%\.dsh\profiles\desktop\cordis.patch.yml`），或本包自带的 [cordis.patch.yml](cordis.patch.yml) 里。按行 id 覆盖时 **`config` 是整块替换、不深合并**，所以要保留的键都得写出来。
+
+最小配置：
+
+```yaml
+- id: wechat-bridge
+  name: dsh-wechat-bridge
+  config:
+    kind: generic
+    gateway:
+      sendUrl: 'http://127.0.0.1:8787/send'   # 你的网关：插件 POST 回复到这里
+      sharedSecret: 'change-me'               # 入站校验（header: X-WeChat-Secret）
+    reply:
+      autoReply: true
+      mode: raw
+      agentPreset: wechat-agent
+      selfNames: ['小助手']                    # 群里只在这几个名字被 @ 时自动回
+      allowedChatIds: []                      # 白名单，留空=不限
+    persona:
+      file: ./persona/wechat-persona.md
+```
+
+全部配置项见 [使用说明书 · 配置手册](使用说明书.md#4-配置手册)。
+
+## 协议（generic）
+
+**入站** `POST /wechat/webhook`（header `X-WeChat-Secret`）：
+
+```json
+{ "chatId": "wxid_abc", "chatName": "阿黄", "kind": "private",
+  "senderId": "wxid_abc", "senderName": "阿黄", "text": "在吗", "messageId": "m1" }
+```
+
+**出站** `POST <gateway.sendUrl>`：
+
+```json
+{ "action": "send", "chatId": "wxid_abc", "text": "在的",
+  "replyToMessageId": null, "atUserId": null, "raw": true }
+```
+
+`200 {"accepted":true}` = 收下并已入库；`202 {"accepted":false}` = 收下但丢弃（白名单外/空文本）；`401` = secret 不对。
+本地网关桩：`node scripts/recv.mjs 8787`，收到就写 `.recv.log`。
+
+## agent 模式 wechat-agent
+
+`presets/wechat-agent.patch.yml`（**生成物，勿手改**）：
+
+| 组成 | 作用 |
+|---|---|
+| `@deepseek-ai/dsh-persona` | `prefix` = [persona/wechat-persona.md](persona/wechat-persona.md) 渲染后的正文 |
+| `dsh-tool-web` | 让 agent 能查资料再回 |
+| `dsh-tool-todo` / `dsh-tool-ask-user` | 任务清单 / 结构化提问 |
+| `dsh-compaction-*`（group+isolate） | 长会话压缩 |
+
+改人格：
+
+```powershell
+notepad persona\wechat-persona.md
+node scripts\build-preset.mjs          # 重新渲染 preset patch
+node scripts\build-preset.mjs --check  # 校验没漂移
+```
+
+改完**新建会话**才生效（已有会话保留旧人格）。人格正文里不要出现 `{{…}}`：preset 的 `prefix` 是模板，未知引用会让提示词组装直接抛错。
+
+## 工具面
+
+| 工具 | 作用 |
+|---|---|
+| `wechat_status` | 网关/计数/未读/人格/最近错误 |
+| `wechat_diagnose` | 自检自动回复链路：真建探针会话 + 投递一条，失败直说原因 |
+| `wechat_list_chats` | 会话列表（含未读、托管会话 id） |
+| `wechat_get_unread_messages` | 读未读（不自动已读） |
+| `wechat_get_recent_messages` | 读最近消息（含自己发的） |
+| `wechat_send_message` | 发文本；`messages` 数组分多条 |
+| `wechat_get_members` | 群成员 |
+| `wechat_mark_read` | 提交已读水位 |
+| `wechat_memory_append` / `_query` / `_remove` | 轻量记忆：话题 / 想说没说的话 / 成员印象 |
+| `wechat_get_prompt` | 当前人格 + 配置摘要 + 工具清单 |
+
+人命令：`/wechat on | off | status | reset`。
+
+## 状态文件
+
+`~/.dsh/wechat-bridge/state.json`：会话、消息（每会话上限 `history.maxMessages`）、记忆、微信会话 → DSH 会话映射、最近一次错误。`/wechat reset` 清空本地缓存（不动真实微信、不删已有 DSH 会话）。
+
+## 已验证 / 未验证
+
+在本机（DSH Desktop，Windows）实测通过：
+
+- 插件激活，12 个 `wechat_*` 工具对 agent 可见；
+- `POST /wechat/webhook`（含 secret 校验、401/202 分支）入站入库；
+- 按会话创建 `agentPreset: wechat-agent` 的 DSH 会话，模型跑到 `turn/end`；
+- 最终文本以 `raw:true` **原样**投递到网关桩（`text` 一个字没改）；
+- 改配置后热点重载生效（autoReply 开关、kind 切换）；
+- 公众号签名验签（GET echostr 原文返回、错误签名 403）+ XML 入站解析。
+
+**未验证**：真实微信侧网关（WeChatFerry / Gewechat / 公众号后台）。插件只约定协议，不含任何 hook 实现。
+
+## 目录
+
+```
+dsh-wechat/
+├─ index.js                      插件本体（网关 / 工具 / 自动回复 / 人格）
+├─ cordis.patch.yml              插件行 + 全量配置骨架
+├─ presets/wechat-agent.patch.yml agent 模式（生成物）
+├─ persona/wechat-persona.md     人格正文（唯一权威源）
+├─ scripts/
+│  ├─ build-preset.mjs           md → preset patch
+│  ├─ selftest.mjs               离线自检（假 ctx + harness 真校验器）
+│  ├─ recv.mjs                   本地网关桩
+│  ├─ peek.mjs                   会话日志（多帧 zstd）读取器
+│  ├─ check.ps1                  一键体检
+│  ├─ scenario-a-local-gateway.ps1
+│  ├─ scenario-b-tool-only.ps1
+│  └─ scenario-c-official-account.ps1
+├─ locale/{zh,en}.json、icon.svg  插件管理器展示元数据
+├─ 使用说明书.md                  完整手册（配置全表 / 网关对接 / 排障 / FAQ）
+└─ LICENSE
+```
+
+## 限制
+
+- 个人微信没有公开 API：需要一个网关把消息推进来，本仓库不提供 hook。
+- 公众号客服消息有 48 小时窗口（`errcode 45015`），长期主动推送需要模板/订阅消息。
+- webhook 路由挂在 DSH 自己的监听上，没有额外鉴权；要公网访问请自建反代 + TLS，只放行 `/wechat/webhook*`。
+- agent 模式不是安全沙箱：preset 里挂的插件可以执行 Host 代码。
+
+## License
+
+MIT

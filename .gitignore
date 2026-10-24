@@ -1,0 +1,19 @@
+# 依赖
+node_modules/
+
+# 本地联调产物
+.recv.log
+*.log
+*.zstd
+stub.pid
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 本地覆盖（个人配置，不要提交）
+cordis.patch.local.yml
+*.bak
+*.bak-*

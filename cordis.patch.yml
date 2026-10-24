@@ -1,0 +1,60 @@
+# dsh-wechat-bridge 的 bundle patch：
+#   1. 插入 Host 插件行 `wechat-bridge`（网关 + wechat_* 工具 + 自动回复）。
+#   2. agent 模式（preset）在 presets/wechat-agent.patch.yml，由 scripts/build-preset.mjs 生成。
+#
+# 只改这里的 config 即可调整行为；override 一条同 id 的行会整块替换 config，
+# 所以下面把全部可调项写成骨架，删掉不需要的键即可回落到代码默认值。
+
+- insert:
+    - id: wechat-bridge
+      name: dsh-wechat-bridge
+      config:
+        enabled: true
+        # generic=任意自建网关（推荐先用它把链路跑通）；official=微信公众平台；wecom=企业微信群机器人
+        kind: generic
+        webhookPath: /wechat/webhook
+        gateway:
+          # generic 出站投递地址：POST {"action":"send","chatId","text",...}
+          sendUrl: 'http://127.0.0.1:8787/send'
+          # generic 入站校验密钥（请求头 X-WeChat-Secret），留空不校验
+          sharedSecret: ''
+          # official 公众号凭据
+          appId: ''
+          appSecret: ''
+          token: ''
+          # wecom 群机器人 webhook
+          wecomWebhook: ''
+        reply:
+          autoReply: true
+          # raw=模型最终文本原样发出（“原样输出”）；formatted=加前后缀
+          mode: raw
+          prefix: ''
+          suffix: ''
+          # 自动回复使用的 agent 模式；人格 md 由该模式注入
+          agentPreset: wechat-agent
+          # preset 解析失败时回落到谁；留空 = 直接失败并记 lastError
+          fallbackPreset: ''
+          provider: ''
+          model: ''
+          permissionPreset: ''
+          workingDirectory: ''
+          # 白名单：填了只接受这些 wxid / 群 id
+          allowedChatIds: []
+          # 群里只在被 @ 这些名字时自动回
+          selfNames: []
+          maxReplyChars: 1800
+          truncateSuffix: '…（略）'
+          fallbackText: ''
+          idleSessionMs: 1800000
+        persona:
+          # 人格提示词 markdown（相对路径按插件包目录解析）
+          file: ./persona/wechat-persona.md
+          # 自动回复会话的人格由 preset 注入；这里默认关闭以免重复。
+          # 用自定义 preset（里面没有 persona 行）时把它改成 true。
+          inject: false
+          # sessions=只注入本插件托管的微信会话；all=插件内全局注册（影响所有会话）
+          scope: sessions
+        history:
+          maxMessages: 200
+        stateFile: ''
+        debug: false
