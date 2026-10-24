@@ -17,3 +17,11 @@ Thumbs.db
 cordis.patch.local.yml
 *.bak
 *.bak-*
+
+# 面板预览与测量脚本的临时产物
+scripts/fixtures/preview/
+scripts/fixtures/shots/
+scripts/fixtures/*.one.js
+scripts/fixtures/panel-section.md
+scripts/fixtures/api-section.md
+.playwright-cli/

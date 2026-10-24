@@ -1,18 +1,22 @@
 {
   "name": "dsh-wechat-bridge",
-  "version": "0.1.0",
-  "description": "微信接入桥接插件：Webhook/Official Account 网关 + wechat_* 工具 + 每会话自动回复 agent，并附带可注入人格 md 的 wechat-agent 模式",
+  "version": "0.2.0",
+  "description": "微信接入桥接插件：Webhook/Official Account 网关 + wechat_* 工具 + 每会话自动回复 agent，并附带一个一键启动的统一管理面板",
   "type": "module",
   "private": true,
   "license": "MIT",
   "main": "index.js",
   "exports": {
     ".": "./index.js",
+    "./client": "./client.js",
     "./locale/*.json": "./locale/*.json",
-    "./icon": "./icon.svg"
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
   },
   "files": [
     "index.js",
+    "client.js",
+    "lib/**/*.js",
     "cordis.patch.yml",
     "presets/*.patch.yml",
     "persona/*.md",
@@ -30,6 +34,14 @@
       "patch": [
         "./cordis.patch.yml",
         "./presets/wechat-agent.patch.yml"
+      ]
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-layout"
       ]
     }
   }

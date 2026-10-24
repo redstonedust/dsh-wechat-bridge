@@ -21,6 +21,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve as resolvePath } from 'node:path'
+import { createPanel, mergeDeep, readOverride } from './lib/panel.js'
 
 /** 插件行名。 */
 export const name = 'wechat-bridge'
@@ -257,16 +258,21 @@ function sendText(res, status, text) {
  * @param {object} config 插件行配置。
  */
 export function apply(ctx, config) {
-  const cfg = withDefaults(config)
+  // 面板写入的覆盖值压在最上层：行配置仍是权威，但面板改的能生效且不写坏 YAML。
+  const override = readOverride()
+  const cfg = withDefaults(mergeDeep(config ?? {}, override))
+  /** 面板句柄：路由注册后才可用，供 hooks 上报事件（可能早于注册）。 */
+  let panel
   const log = (level, message) => {
     const logger = ctx.logger
     if (logger && typeof logger[level] === 'function') logger[level](`wechat-bridge: ${message}`)
     else if (level === 'error') console.error(`wechat-bridge: ${message}`)
+    if (level === 'warn' || level === 'error') panel?.pushEvent(level, message)
   }
   const debug = (message) => {
     if (cfg.debug) log('info', message)
   }
-  /** 记下最近一次失败，并通过 /status 与 wechat_status 暴露，便于没有日志时定位。 */
+  /** 记下最近一次失败，并通过 /status、面板与 wechat_status 暴露，便于没有日志时定位。 */
   const recordError = (phase, error) => {
     const message = String(error?.message ?? error)
     state.lastError = { at: Date.now(), phase, message: message.slice(0, 400) }
@@ -638,6 +644,27 @@ export function apply(ctx, config) {
     }
   }
 
+  // ── 面板快照 ────────────────────────────────────────────────────────────
+  /** 预设名册：agentPresets.list() 是异步的，而快照必须同步，所以缓存 10s。 */
+  const presets = { at: 0, list: [], error: '' }
+  const refreshPresets = async () => {
+    if (!agentApi?.agentPresets?.list) return
+    try {
+      const list = await agentApi.agentPresets.list()
+      presets.list = (Array.isArray(list) ? list : []).map((preset) => withoutUndefined({
+        id: String(preset?.id ?? ''),
+        name: preset?.name === undefined ? undefined : String(preset.name),
+        description: preset?.description === undefined ? undefined : String(preset.description),
+        isDefault: preset?.isDefault === undefined ? undefined : Boolean(preset.isDefault),
+        broken: preset?.broken === undefined ? undefined : String(preset.broken),
+      }))
+      presets.error = ''
+    } catch (error) {
+      presets.error = String(error?.message ?? error).slice(0, 300)
+    }
+    presets.at = Date.now()
+  }
+
   /** 可选服务接线：agent 运行时。 */
   ctx.inject(['agents', 'agentPresets'], (scoped) => {
     agentApi = {
@@ -649,6 +676,7 @@ export function apply(ctx, config) {
       workspaceRegistry: scoped.get('workspaceRegistry'),
     }
     debug('agent services wired')
+    void refreshPresets()
   })
 
   // ── 入站消息规范化 ──────────────────────────────────────────────────────
@@ -692,6 +720,210 @@ export function apply(ctx, config) {
 
   // ── HTTP 路由 ───────────────────────────────────────────────────────────
   const path = cfg.webhookPath.startsWith('/') ? cfg.webhookPath : `/${cfg.webhookPath}`
+  /** 面板管理接口前缀：默认 /wechat/webhook → /wechat/api/*。 */
+  const PANEL_BASE = path.endsWith('/webhook') ? path.slice(0, -'/webhook'.length) || '/' : path
+
+  const chatSummary = () => [...state.chats.values()].map((chat) => ({
+    chatId: chat.chatId,
+    name: chat.name || chat.chatId,
+    kind: chat.kind,
+    unread: unreadOf(chat.chatId).length,
+    messages: messagesOf(chat.chatId).length,
+    lastAt: chat.lastAt ?? 0,
+    readThrough: chat.readThrough ?? 0,
+    sessionId: state.sessions.get(chat.chatId) ?? null,
+    members: Array.isArray(chat.members) ? chat.members.length : 0,
+  })).sort((left, right) => (right.lastAt ?? 0) - (left.lastAt ?? 0))
+
+  const snapshot = () => {
+    if (Date.now() - presets.at > 10000) void refreshPresets()
+    const chats = chatSummary()
+    return {
+      ok: true,
+      plugin: { name, activatedAt: state.startedAt, uptimeMs: Date.now() - state.startedAt },
+      config: {
+        kind: cfg.kind,
+        webhookPath: path,
+        apiBase: `${PANEL_BASE}/api`,
+        enabled: cfg.enabled,
+        agentPreset: cfg.reply.agentPreset,
+        fallbackPreset: cfg.reply.fallbackPreset,
+        mode: cfg.reply.mode,
+        prefix: cfg.reply.prefix,
+        suffix: cfg.reply.suffix,
+        maxReplyChars: cfg.reply.maxReplyChars,
+        fallbackText: cfg.reply.fallbackText,
+        allowedChatIds: cfg.reply.allowedChatIds ?? [],
+        selfNames: cfg.reply.selfNames ?? [],
+        idleSessionMs: cfg.reply.idleSessionMs,
+        maxMessages: cfg.history.maxMessages,
+        debug: cfg.debug,
+        // 凭据只回「是否已设置」，绝不把明文送进浏览器
+        gateway: {
+          sendUrl: cfg.gateway.sendUrl,
+          appId: cfg.gateway.appId,
+          wecom: Boolean(cfg.gateway.wecomWebhook),
+          sharedSecretSet: Boolean(cfg.gateway.sharedSecret),
+          appSecretSet: Boolean(cfg.gateway.appSecret),
+          tokenSet: Boolean(cfg.gateway.token),
+        },
+      },
+      autoReply: !autoReplyOff,
+      agentServices: Boolean(agentApi),
+      presets: presets.list,
+      presetsError: presets.error,
+      persona: { file: cfg.persona.file ?? '', chars: personaText.length, inject: Boolean(cfg.persona.inject) },
+      chats,
+      counters: state.counters,
+      lastError: state.lastError,
+      sessions: state.sessions.size,
+      memory: {
+        topics: state.memory.topics.length,
+        thoughts: state.memory.thoughts.length,
+        impressions: state.memory.impressions.length,
+      },
+      override,
+    }
+  }
+
+  // ── 面板动作 ────────────────────────────────────────────────────────────
+  const hooks = {
+    listChats: chatSummary,
+
+    readChat: (chatId, limit) => {
+      const chat = state.chats.get(chatId)
+      const list = messagesOf(chatId).slice(-limit)
+      return {
+        chat: chat ? { chatId: chat.chatId, name: chat.name, kind: chat.kind, readThrough: chat.readThrough ?? 0, lastAt: chat.lastAt ?? 0 } : null,
+        messages: list,
+        unread: unreadOf(chatId).length,
+      }
+    },
+
+    /** 标记已读到某个水位（面板里点「标记已读」）。 */
+    markRead: (chatId, throughSeq) => {
+      const chat = chatOf(chatId)
+      const list = messagesOf(chatId)
+      const lastInbound = list.filter((message) => message.direction === 'in').reduce((max, message) => Math.max(max, message.seq), 0)
+      const wanted = Number.isFinite(Number(throughSeq)) && Number(throughSeq) > 0
+        ? Math.min(Number(throughSeq), state.seq)
+        : (lastInbound > 0 ? lastInbound : state.seq)
+      chat.readThrough = Math.max(chat.readThrough ?? 0, wanted)
+      persist()
+      return { ok: true, chatId, readThroughSeq: chat.readThrough, unreadCount: unreadOf(chatId).length }
+    },
+
+    /** 入站自测：默认只走「校验 + 落库」，不唤醒 agent（避免真的往微信发消息）。 */
+    inbound: async (body) => {
+      const chatId = String(body?.chatId ?? '').trim() || 'wechat-selftest'
+      const text = String(body?.text ?? '').trim() || '面板入站自测'
+      const wake = body?.wake === true
+      if (wake) {
+        const accepted = dispatchInbound({
+          chatId,
+          chatName: chatId,
+          kind: String(body?.kind ?? 'private'),
+          text,
+          senderId: 'panel',
+          senderName: '面板自测',
+        })
+        return accepted
+          ? { ok: true, chatId, detail: '已受理并唤醒 agent；回复结束时会投递回微信' }
+          : { ok: false, chatId, detail: '未受理：chatId 被 allowedChatIds 拦截，或文本为空' }
+      }
+      const accepted = ingest({
+        chatId,
+        chatName: chatId,
+        kind: String(body?.kind ?? 'private'),
+        text,
+        senderId: 'panel',
+        senderName: '面板自测',
+      })
+      return accepted
+        ? { ok: true, chatId, detail: `已落库（seq ${accepted.message.seq}），未唤醒 agent` }
+        : { ok: false, chatId, detail: '未受理：chatId 被 allowedChatIds 拦截，或文本为空' }
+    },
+
+    /** 出站自测：真投递一条。 */
+    outbound: async (body) => {
+      const chatId = String(body?.chatId ?? '').trim()
+      const text = String(body?.text ?? '').trim()
+      if (!chatId) return { ok: false, detail: '缺少 chatId' }
+      if (!text) return { ok: false, detail: '缺少 text' }
+      const outcome = await deliver(chatId, replyText(text))
+      if (outcome.ok) {
+        state.counters.outbound += 1
+        pushMessage(chatId, { direction: 'out', text, senderId: 'panel', senderName: 'panel' })
+      }
+      return { ok: outcome.ok, chatId, detail: outcome.detail }
+    },
+
+    /**
+     * 入站链路体检：用临时会话走一遍真实的 ingest（含 allowedChatIds 过滤与落库），
+     * 校验完立刻把临时会话从内存里擦掉，不留痕迹、不碰网络。
+     */
+    selftestInbound: async () => {
+      const probeId = `wechat-probe-${randomUUID().slice(0, 8)}`
+      try {
+        const accepted = ingest({ chatId: probeId, chatName: probeId, kind: 'private', text: '入站链路自检', senderId: 'probe' })
+        if (!accepted) {
+          const blocked = (cfg.reply.allowedChatIds ?? []).filter(Boolean).length > 0
+          return {
+            ok: false,
+            detail: blocked
+              ? `被 allowedChatIds 拦截（当前白名单 ${cfg.reply.allowedChatIds.length} 项）`
+              : 'ingest 拒绝了探针消息',
+          }
+        }
+        return { ok: true, detail: `落库正常（seq ${accepted.message.seq}，临时会话已清理）` }
+      } finally {
+        state.chats.delete(probeId)
+        state.messages.delete(probeId)
+        persist()
+      }
+    },
+
+    /** 网关可达性：拿到任何 HTTP 响应即为可达，网络层失败才算不可达。 */
+    selftestGateway: async () => {
+      const url = cfg.gateway.sendUrl
+      if (!url) return { ok: false, skipped: true, detail: '未配置 gateway.sendUrl' }
+      const controller = typeof AbortController === 'function' ? new AbortController() : null
+      const timer = controller === null ? null : setTimeout(() => controller.abort(), 4000)
+      try {
+        const headers = { 'content-type': 'application/json' }
+        if (cfg.gateway.sharedSecret) headers['x-wechat-secret'] = cfg.gateway.sharedSecret
+        const response = await fetch(url, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ action: 'probe', probe: true }),
+          signal: controller === null ? undefined : controller.signal,
+        })
+        return {
+          ok: true,
+          detail: `HTTP ${response.status}（探针不带 chatId/text，网关应忽略；4xx/5xx 也算可达）`,
+        }
+      } catch (error) {
+        const aborted = controller !== null && controller.signal.aborted
+        return { ok: false, detail: aborted ? '4 秒超时' : String(error?.message ?? error).slice(0, 300) }
+      } finally {
+        if (timer !== null) clearTimeout(timer)
+      }
+    },
+
+    /** 清本地缓存（等同 /wechat reset），不动真实微信会话与 DSH session。 */
+    reset: () => {
+      const chats = state.chats.size
+      state.chats.clear()
+      state.messages.clear()
+      state.sessions.clear()
+      state.memory = { topics: [], thoughts: [], impressions: [] }
+      state.lastError = null
+      relays.clear()
+      persist()
+      return { chats }
+    },
+  }
+
 
   ctx.inject(['webServer'], (scoped) => {
     const server = scoped.webServer
@@ -811,7 +1043,32 @@ export function apply(ctx, config) {
       },
     }), 'wechat-bridge.statusRoute()')
 
-    debug(`routes registered: ${path}`)
+    // 统一管理面板：/api/state、/api/config、/api/console、/api/selftest、/api/chats、/api/reset
+    scoped.effect(() => {
+      const handle = createPanel({
+        server,
+        base: PANEL_BASE,
+        runtime: {
+          conf: cfg,
+          override,
+          setAutoReply: (value) => {
+            autoReplyOff = !value
+            cfg.reply.autoReply = value
+          },
+        },
+        snapshot,
+        hooks,
+      })
+      panel = handle
+      handle.pushEvent('info', '管理面板已挂载', `${handle.api}（${path}）`)
+      void refreshPresets()
+      return () => {
+        panel = undefined
+        void handle.dispose()
+      }
+    }, 'wechat-bridge.panel()')
+
+    debug(`routes registered: ${path} panel: ${PANEL_BASE}/api`)
   })
 
   // ── 工具面 ──────────────────────────────────────────────────────────────

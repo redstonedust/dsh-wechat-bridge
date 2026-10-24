@@ -24,6 +24,7 @@
 - **给 agent 一只手**：注册 12 个 `wechat_*` 工具（看消息、分条发、引用、@人、已读水位、轻量记忆、链路自检）。
 - **自动回复**：每个微信会话映射成一个独立 DSH 会话，跑 `wechat-agent` 模式（人格 markdown 注入），一轮结束把最终文本**原样**发回微信。
 - **两种输出模式**：没调发送工具 → 本轮最终文本原样转发；调了发送工具 → 文本只作思考（agent 自己控制发几条、发什么）。
+- **一个统一管理面板**：装好插件，DSH 侧栏多一个「微信桥接」入口，点开就是完整控制台 —— 配网关、跑通链路、看会话、做体检，全程不用开终端。
 
 ## 安装
 
@@ -32,8 +33,7 @@
 #   plugin_manager({ action: "install_bundle", target: "C:\path\to\dsh-wechat" })
 # 它会自己 pnpm 安装、把包写进 profile 的 dsh.profile.bundles、并应用 patch
 
-# 装完确认
-node scripts\check.ps1
+# 装完重启 DSH，左侧栏就有「微信桥接」入口了
 ```
 
 也可以用你的终端手动确认两件事：
@@ -41,9 +41,41 @@ node scripts\check.ps1
 - `plugin_manager list_plugins` 里 `include:wechat-bridge`、`include:preset-wechat-agent` 都是 `active`；
 - 设置 → Agent 预设里出现「微信远程 Agent」卡片。
 
-## 三个场景脚本
+## 一键面板（推荐，不用终端）
 
-场景对应 [使用说明书.md](使用说明书.md) 第 2 节，脚本在 `scripts/`，都是幂等的（配置写进 profile patch 的受管区块，重复跑只替换该区块）。
+装好插件后重启 DSH，**左侧栏会出现「微信桥接」图标（微信气泡）**，点开就是完整控制台。原来要开终端跑的三个脚本，现在都是页面上的按钮。
+
+### 第一次用：只点三步
+
+概览页中间那张「三步跑通」卡片，按顺序点就行，每一步会自己告诉你好没好：
+
+| 步 | 按钮 | 它做了什么 |
+|---|---|---|
+| 1 | **启动测试网关** | 在 `[IP]:8787` 起一个只收不发的假网关（不会真的发微信） |
+| 2 | **指向测试网关** | 把出站地址写成第 1 步那个地址，改完立即生效 |
+| 3 | **发送测试消息** | 让桥接往假网关投一条；下面「最近投递」里出现它，链路就通了 |
+
+三步走完，顶部那条链路图三个节点全绿 —— 这时候接上你自己的微信网关，改一下出站地址，真实消息就能进来了。
+
+### 五个标签页
+
+| 标签 | 干什么 |
+|---|---|
+| **概览** | 链路健康图 · 收发计数 · 三步向导 · 最近事件与投递 |
+| **会话** | 左选会话、右看对话气泡；可提交已读水位 |
+| **控制台** | 造入站消息（可勾「唤醒 agent」）· 单发一条出站 · 起停测试网关 · 清空本地缓存 |
+| **设置** | 网关类型/凭据、回复行为、人格与档位；改完底部保存条一键写入 |
+| **体检** | 7 项自检（相当于 `check.ps1`），每项不合格都直接给修法 |
+
+### 面板改的东西存在哪
+
+`%USERPROFILE%\.dsh\wechat-bridge\config.override.json` —— 只存你改过的键，**不动 profile 的 `cordis.patch.yml`**。设置页底部的「清空覆盖值」可以退回行配置的权威状态。
+
+密钥（`sharedSecret` / `appSecret` / `token`）永远不回传到浏览器：面板只显示「已设置」的布尔位，输入框留空 = 不修改。
+
+## 高级：命令行脚本（可选）
+
+面板覆盖不到的场景才需要它们，都在 `scripts/`，幂等（配置写进 profile patch 的受管区块，重复跑只替换该区块）。
 
 ```powershell
 # A. 本地跑通整条链路（不连真实微信）：起网关桩 → 推消息 → 等原样投递
@@ -82,6 +114,22 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\check.ps1
 ```
 
 > 每个脚本都支持 `-WhatIf`：只打印会写进 profile patch 的配置，不动文件。
+
+## 面板 HTTP API
+
+面板是纯前端 + Host API，两者同一套路由；都是本机回环才允许访问（拒绝带 `x-forwarded-for` 的请求）。
+
+| 方法 | 路径 | 作用 |
+|---|---|---|
+| GET | `/wechat/api/state` | 全量快照：配置（脱敏）、计数、事件、投递、会话 |
+| GET | `/wechat/api/chats?chatId=&limit=` | 会话列表 / 某会话消息 |
+| POST | `/wechat/api/read` | 提交已读水位 `{chatId, throughSeq?}` |
+| GET·PUT | `/wechat/api/config` | 读配置 / 写覆盖值 `{config:{...}}`·`{action:'reset'}` |
+| POST | `/wechat/api/console` | `inbound` / `outbound` / `stub-start` / `stub-stop` |
+| POST | `/wechat/api/selftest` | 跑 7 项体检 |
+| POST | `/wechat/api/reset` | 清空本地缓存 |
+
+`/wechat` 这一段来自 `webhookPath` 去掉尾部的 `/webhook`，改了 `webhookPath` 记得重启。
 
 ## 配置
 
@@ -188,15 +236,19 @@ node scripts\build-preset.mjs --check  # 校验没漂移
 ```
 dsh-wechat/
 ├─ index.js                      插件本体（网关 / 工具 / 自动回复 / 人格）
+├─ client.js                     浏览器端统一管理面板（React，无需构建）
+├─ lib/panel.js                  面板 Host API（快照 / 配置 / 控制台 / 自检 / 网关桩）
 ├─ cordis.patch.yml              插件行 + 全量配置骨架
 ├─ presets/wechat-agent.patch.yml agent 模式（生成物）
 ├─ persona/wechat-persona.md     人格正文（唯一权威源）
 ├─ scripts/
 │  ├─ build-preset.mjs           md → preset patch
 │  ├─ selftest.mjs               离线自检（假 ctx + harness 真校验器）
-│  ├─ recv.mjs                   本地网关桩
+│  ├─ verify-client.mjs          面板 SSR 冒烟测试（不需要浏览器）
+│  ├─ fixtures/snapshot.json     面板测试用的快照样本
+│  ├─ recv.mjs                   本地网关桩（独立进程版）
 │  ├─ peek.mjs                   会话日志（多帧 zstd）读取器
-│  ├─ check.ps1                  一键体检
+│  ├─ check.ps1                  命令行体检
 │  ├─ scenario-a-local-gateway.ps1
 │  ├─ scenario-b-tool-only.ps1
 │  └─ scenario-c-official-account.ps1
