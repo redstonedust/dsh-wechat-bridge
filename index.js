@@ -21,7 +21,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve as resolvePath } from 'node:path'
-import { createPanel, mergeDeep, readOverride } from './lib/panel.js'
+import { createPanel, mergeDeep, readOverride, OVERRIDE_FILE } from './lib/panel.js'
 
 /** 插件行名。 */
 export const name = 'wechat-bridge'
@@ -258,8 +258,15 @@ function sendText(res, status, text) {
  * @param {object} config 插件行配置。
  */
 export function apply(ctx, config) {
+  // 覆盖值文件：默认 ~/.dsh/wechat-bridge/config.override.json；
+  // 自检/测试可以指到临时文件，绝不碰真实配置。
+  const overrideFile = (() => {
+    const wanted = config?.overrideFile
+    if (!wanted || typeof wanted !== 'string') return OVERRIDE_FILE
+    return isAbsolute(wanted) ? wanted : resolvePath(process.cwd(), wanted)
+  })()
   // 面板写入的覆盖值压在最上层：行配置仍是权威，但面板改的能生效且不写坏 YAML。
-  const override = readOverride()
+  const override = readOverride(overrideFile)
   const cfg = withDefaults(mergeDeep(config ?? {}, override))
   /** 面板句柄：路由注册后才可用，供 hooks 上报事件（可能早于注册）。 */
   let panel
@@ -1058,6 +1065,7 @@ export function apply(ctx, config) {
         },
         snapshot,
         hooks,
+        overrideFile,
       })
       panel = handle
       handle.pushEvent('info', '管理面板已挂载', `${handle.api}（${path}）`)

@@ -13,14 +13,20 @@
  */
 import { pathToFileURL } from 'node:url'
 import { EventEmitter } from 'node:events'
-import { rmSync } from 'node:fs'
+import { readFileSync, rmSync } from 'node:fs'
+import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import assert from 'node:assert/strict'
+import { readOverride } from '../lib/panel.js'
 
 // 自检用独立状态文件，绝不碰真实 ~/.dsh/wechat-bridge/state.json
 const STATE_FILE = join(tmpdir(), `wechat-bridge-selftest-${process.pid}.json`)
 rmSync(STATE_FILE, { force: true })
+
+// 面板覆盖值也写到临时文件（面板默认会写 ~/.dsh/wechat-bridge/config.override.json）
+const OVERRIDE_FILE = join(tmpdir(), `wechat-bridge-selftest-override-${process.pid}.json`)
+rmSync(OVERRIDE_FILE, { force: true })
 
 const DSH_MODULES = 'file:///C:/Users/han/AppData/Local/Programs/DSH%20Desktop/resources/app/node_modules/@deepseek-ai/dsh-tools/lib/index.js'
 const tools = await import(DSH_MODULES)
@@ -33,9 +39,10 @@ const bad = (label, error) => {
   failures += 1
   console.error(`  ✗ ${label}\n    ${error?.stack ?? error}`)
 }
-const check = (label, fn) => {
+const check = async (label, fn) => {
   try {
-    fn()
+    // 支持返回 Promise 的用例：等它落定再判定，避免未捕获的 rejection 直接掀桌
+    await fn()
     ok(label)
   } catch (error) {
     bad(label, error)
@@ -122,6 +129,12 @@ const services = {
   commands: { register: (def) => { registrations.commands.push(def); return () => {} } },
   agents: fakeAgents,
   agentPresets: {
+    async list() {
+      return [
+        { id: 'wechat-agent', name: '微信桥接', isDefault: false },
+        { id: 'standard', name: '标准', isDefault: true },
+      ]
+    },
     async resolve(id) { return { id: id ?? 'standard' } },
     async acquireScope() { return { [Symbol.asyncDispose]: async () => {} } },
     async mount() {},
@@ -139,32 +152,33 @@ globalThis.fetch = async (url, init) => {
 
 console.log(`\n[1] 激活 ${name}（inject=${JSON.stringify(inject)}）`)
 const ctx = makeCtx(services)
-check('apply() 不抛异常', () => apply(ctx, {
+await check('apply() 不抛异常', () => apply(ctx, {
   gateway: { sendUrl: 'http://127.0.0.1:9999/send', sharedSecret: 'sekret' },
   reply: { autoReply: true, mode: 'raw', agentPreset: 'wechat-agent' },
   persona: { inject: true, scope: 'all' },
   stateFile: STATE_FILE,
+  overrideFile: OVERRIDE_FILE,
   debug: false,
 }))
-check('注册了 12 个工具', () => assert.equal(registrations.tools.length, 12))
-check('注册了 webhook 路由', () => assert.ok(webRoutes.has('/wechat/webhook')))
-check('注册了状态路由', () => assert.ok(webRoutes.has('/wechat/webhook/status')))
-check('注入了人格 md（全局 scope=all，且关闭模板插值）', () => {
+await check('注册了 12 个工具', () => assert.equal(registrations.tools.length, 12))
+await check('注册了 webhook 路由', () => assert.ok(webRoutes.has('/wechat/webhook')))
+await check('注册了状态路由', () => assert.ok(webRoutes.has('/wechat/webhook/status')))
+await check('注入了人格 md（全局 scope=all，且关闭模板插值）', () => {
   const persona = registrations.sections.find((s) => s.name === 'wechat-bridge/persona')
   assert.ok(persona, 'persona section missing')
   assert.ok(persona.text.length > 200, `persona too short: ${persona.text.length}`)
   assert.equal(persona.interpolate, false)
 })
-check('注册了 /wechat 命令', () => assert.equal(registrations.commands[0]?.name, 'wechat'))
-check('监听了 session/event', () => assert.ok(registrations.listeners.some((l) => l.event === 'session/event')))
+await check('注册了 /wechat 命令', () => assert.equal(registrations.commands[0]?.name, 'wechat'))
+await check('监听了 session/event', () => assert.ok(registrations.listeners.some((l) => l.event === 'session/event')))
 
 console.log('\n[2] 工具契约校验（用 harness 自己的校验器）')
 for (const tool of registrations.tools) {
-  check(`${tool.name}: 参数是合法 JSON Schema（object-rooted）`, () => {
+  await check(`${tool.name}: 参数是合法 JSON Schema（object-rooted）`, () => {
     tools.assertSupportedJsonSchema(tool.parameters)
     assert.equal(tool.parameters.type, 'object')
   })
-  check(`${tool.name}: 输出 schema 是合法 object-rooted 子集`, () => tools.assertObjectJsonSchema(tool.output.schema))
+  await check(`${tool.name}: 输出 schema 是合法 object-rooted 子集`, () => tools.assertObjectJsonSchema(tool.output.schema))
 }
 
 console.log('\n[3] webhook 入站 + 自动回复链路')
@@ -189,18 +203,18 @@ const deliverAck = async (path, method, body, headers = {}) => {
 
 await (async () => {
   const unauthorized = await deliverAck('/wechat/webhook', 'POST', { chatId: 'wxid_a', text: 'hi' }, {})
-  check('缺 secret 时 401', () => assert.equal(unauthorized.statusCode, 401))
+  await check('缺 secret 时 401', () => assert.equal(unauthorized.statusCode, 401))
 
   const res = await deliverAck('/wechat/webhook', 'POST', { chatId: 'wxid_a', chatName: '阿黄', text: '在吗' }, { 'x-wechat-secret': 'sekret' })
-  check('带 secret 时 200 且 accepted', () => {
+  await check('带 secret 时 200 且 accepted', () => {
     assert.equal(res.statusCode, 200)
     assert.equal(JSON.parse(res.body).accepted, true)
   })
   await new Promise((r) => setTimeout(r, 30))
-  check('会话作用域又注入了一份人格（不污染其它会话）', () => {
+  await check('会话作用域又注入了一份人格（不污染其它会话）', () => {
     assert.equal(registrations.sections.filter((s) => s.name === 'wechat-bridge/persona').length, 2)
   })
-  check('创建了 agent session 并 followup', () => {
+  await check('创建了 agent session 并 followup', () => {
     assert.equal(created.length, 1)
     assert.equal(followups.length, 1)
     assert.equal(created[0].meta.agentPreset, 'wechat-agent')
@@ -208,7 +222,7 @@ await (async () => {
   })
 
   const statusRes = await deliverAck('/wechat/webhook/status', 'GET')
-  check('状态路由报告入站 1', () => {
+  await check('状态路由报告入站 1', () => {
     const payload = JSON.parse(statusRes.body)
     assert.equal(payload.counters.inbound, 1)
     assert.equal(payload.persona.injected, true)
@@ -222,7 +236,7 @@ await (async () => {
   listener({ header: { id: sessionId } }, { type: 'assistant/message', data: { turn: 1, step: 1, message: { content: [{ type: 'text', text: '在的，怎么了' }] } } })
   listener({ header: { id: sessionId } }, { type: 'turn/end', data: { turn: 1, reason: 'stop' } })
   await new Promise((r) => setTimeout(r, 30))
-  check('turn 结束后原样投递回微信', () => {
+  await check('turn 结束后原样投递回微信', () => {
     const out = sent.filter((s) => s.url === 'http://127.0.0.1:9999/send')
     assert.equal(out.length, 1)
     assert.equal(out[0].body.text, '在的，怎么了')
@@ -244,32 +258,32 @@ await (async () => {
   }
 
   const status = await call('wechat_status')
-  check('wechat_status 计数正确', () => {
+  await check('wechat_status 计数正确', () => {
     assert.equal(status.chats, 1)
     assert.equal(status.inbound, 1)
     assert.equal(status.outbound, 1)
   })
 
   const chats = await call('wechat_list_chats')
-  check('wechat_list_chats 含 wxid_a', () => assert.equal(chats.chats[0].chatId, 'wxid_a'))
+  await check('wechat_list_chats 含 wxid_a', () => assert.equal(chats.chats[0].chatId, 'wxid_a'))
 
   const recent = await call('wechat_get_recent_messages', { chatId: 'wxid_a', limit: 10 })
-  check('wechat_get_recent_messages 有进出两条', () => {
+  await check('wechat_get_recent_messages 有进出两条', () => {
     assert.ok(recent.messages.length >= 2)
     assert.equal(recent.messages.at(-1).direction, 'out')
   })
 
   const unread = await call('wechat_get_unread_messages', { chatId: 'wxid_a' })
-  check('未读 1 条且水位 0', () => {
+  await check('未读 1 条且水位 0', () => {
     assert.equal(unread.unreadCount, 1)
     assert.equal(unread.readThroughSeq, 0)
   })
 
   const marked = await call('wechat_mark_read', { chatId: 'wxid_a', throughSeq: unread.messages[0].seq })
-  check('mark_read 后未读清零', () => assert.equal(marked.unreadCount, 0))
+  await check('mark_read 后未读清零', () => assert.equal(marked.unreadCount, 0))
 
   const sentOut = await call('wechat_send_message', { chatId: 'wxid_a', messages: ['第一句', '第二句'] })
-  check('多段发送逐条投递', () => {
+  await check('多段发送逐条投递', () => {
     assert.equal(sentOut.ok, true)
     assert.equal(sentOut.sent.length, 2)
     assert.equal(sent.filter((s) => s.body?.text === '第二句').length, 1)
@@ -277,15 +291,15 @@ await (async () => {
 
   await call('wechat_memory_append', { category: 'memberImpression', content: '爱用反问', target: '阿黄' })
   const mem = await call('wechat_memory_query', {})
-  check('记忆写入/查询', () => assert.equal(mem.entries.length, 1))
+  await check('记忆写入/查询', () => assert.equal(mem.entries.length, 1))
   const removed = await call('wechat_memory_remove', { category: 'memberImpression', target: '阿黄' })
-  check('记忆删除', () => assert.equal(removed.removed, 1))
+  await check('记忆删除', () => assert.equal(removed.removed, 1))
 
   const members = await call('wechat_get_members', { chatId: 'wxid_a' })
-  check('成员来自已知发言人', () => assert.ok(members.members.some((m) => m.userId === 'wxid_a')))
+  await check('成员来自已知发言人', () => assert.ok(members.members.some((m) => m.userId === 'wxid_a')))
 
   const prompt = await call('wechat_get_prompt')
-  check('get_prompt 带人格与工具清单', () => {
+  await check('get_prompt 带人格与工具清单', () => {
     assert.ok(prompt.persona.length > 200)
     assert.equal(prompt.tools.length, 12)
   })
@@ -294,21 +308,296 @@ await (async () => {
 console.log('\n[5] 群聊白名单与 @ 过滤')
 await (async () => {
   const res = await deliverAck('/wechat/webhook', 'POST', { chatId: 'room1', roomId: 'room1', kind: 'group', chatName: '测试群', text: '大家好', senderId: 'wxid_b', senderName: '小B' }, { 'x-wechat-secret': 'sekret' })
-  check('群消息仍然入库', () => assert.equal(res.statusCode, 200))
+  await check('群消息仍然入库', () => assert.equal(res.statusCode, 200))
   await new Promise((r) => setTimeout(r, 20))
-  check('未配置 selfNames 时群消息也会唤醒 agent', () => assert.equal(created.length, 2))
+  await check('未配置 selfNames 时群消息也会唤醒 agent', () => assert.equal(created.length, 2))
 })()
 
 console.log('\n[6] 命令处理')
 await (async () => {
   const command = registrations.commands[0]
   const offResult = await command.handler({ rawInput: 'off', agent: {}, attachments: [], signal: new AbortController().signal })
-  check('/wechat off 关闭自动回复', () => assert.equal(offResult.kind, 'success'))
+  await check('/wechat off 关闭自动回复', () => assert.equal(offResult.kind, 'success'))
   const statusResult = await command.handler({ rawInput: 'status', agent: {}, attachments: [], signal: new AbortController().signal })
-  check('/wechat status 返回摘要', () => assert.match(statusResult.text, /自动回复 关/))
+  await check('/wechat status 返回摘要', () => assert.match(statusResult.text, /自动回复 关/))
 })()
 
-console.log('\n[7] 日志')
+console.log('\n[7] 管理面板路由')
+
+// 面板配置写到临时文件，绝不碰真实 ~/.dsh/wechat-bridge/config.override.json
+
+await (async () => {
+  // webServer 按「不带 query 的 path」注册路由；req.url 才需要带完整 query
+  const routeOf = (path) => {
+    const routePath = path.split('?')[0]
+    const route = webRoutes.get(routePath)
+    assert.ok(route, `route ${routePath} missing`)
+    return route
+  }
+
+  const panelGet = async (path, headers = {}, remote = '127.0.0.1') => {
+    const route = routeOf(path)
+    const req = new EventEmitter()
+    req.method = 'GET'
+    req.url = path
+    req.headers = headers
+    req.socket = { remoteAddress: remote }
+    const res = { statusCode: 0, headers: {}, writableEnded: false, body: '' }
+    res.setHeader = (k, v) => { res.headers[k.toLowerCase()] = v }
+    res.end = (chunk) => { res.writableEnded = true; res.body = chunk ?? '' }
+    await route.handler(req, res)
+    return { status: res.statusCode, json: () => JSON.parse(res.body), raw: res.body }
+  }
+
+  const panelSend = async (path, method, body, headers = {}, remote = '127.0.0.1') => {
+    const route = routeOf(path)
+    const req = new EventEmitter()
+    req.method = method
+    req.url = path
+    req.headers = headers
+    req.socket = { remoteAddress: remote }
+    req.destroy = () => {}
+    const res = { statusCode: 0, headers: {}, writableEnded: false, body: '' }
+    res.setHeader = (k, v) => { res.headers[k.toLowerCase()] = v }
+    res.end = (chunk) => { res.writableEnded = true; res.body = chunk ?? '' }
+    const done = route.handler(req, res)
+    if (body !== undefined) {
+      req.emit('data', Buffer.from(JSON.stringify(body)))
+    }
+    req.emit('end')
+    await done
+    return { status: res.statusCode, json: () => JSON.parse(res.body), raw: res.body }
+  }
+
+  // 路由全都挂上了
+  for (const suffix of ['state', 'chats', 'config', 'console', 'selftest', 'read', 'reset']) {
+    await check(`注册了 /wechat/api/${suffix}`, () => assert.ok(webRoutes.has(`/wechat/api/${suffix}`)))
+  }
+
+  // 回环守卫
+  const viaProxy = await panelGet('/wechat/api/state', { 'x-forwarded-for': '10.0.0.9' })
+  await check('带 x-forwarded-for 一律 403', () => {
+    assert.equal(viaProxy.status, 403)
+    assert.equal(viaProxy.json().code, 'loopback-only')
+  })
+  const fromPublic = await panelGet('/wechat/api/state', {}, '10.1.2.3')
+  await check('非回环来源 403', () => assert.equal(fromPublic.status, 403))
+  const fromV6 = await panelGet('/wechat/api/state', {}, '::1')
+  await check('IPv6 回环放行', () => assert.equal(fromV6.status, 200))
+
+  // state
+  const state = await panelGet('/wechat/api/state')
+  await check('state 返回快照 + 事件 + 投递 + 桩状态', () => {
+    const payload = state.json()
+    assert.equal(state.status, 200)
+    assert.equal(payload.ok, true)
+    assert.ok(payload.config && typeof payload.config === 'object', 'config missing')
+    assert.ok(Array.isArray(payload.events), 'events missing')
+    assert.ok(Array.isArray(payload.deliveries), 'deliveries missing')
+    assert.ok(payload.stub && typeof payload.stub.running === 'boolean', 'stub missing')
+    assert.ok(Array.isArray(payload.chats), 'chats missing')
+    assert.ok(payload.counters && typeof payload.counters.inbound === 'number', 'counters missing')
+  })
+  await check('state 不泄漏密钥明文', () => {
+    const raw = state.raw
+    assert.ok(!raw.includes('sekret'), 'sharedSecret leaked as plaintext')
+    assert.ok(!/appSecret"\s*:\s*"[^"]+/.test(raw), 'appSecret leaked')
+    assert.ok(!/["']token["']\s*:\s*"[^"]+/.test(raw), 'token leaked')
+    assert.equal(state.json().config.gateway.sharedSecretSet, true)
+    assert.equal(state.json().config.gateway.appSecretSet, false)
+  })
+
+  // chats
+  await check('chats 列表带会话与未读', async () => {
+    const res = await panelGet('/wechat/api/chats')
+    assert.equal(res.status, 200)
+    const list = res.json().chats
+    assert.ok(list.length >= 2, `expected >=2 chats, got ${list.length}`)
+  })
+  await check('chats?chatId= 返回该会话消息', () => {
+    return panelGet('/wechat/api/chats?chatId=wxid_a').then((res) => {
+      const payload = res.json()
+      assert.equal(payload.ok, true)
+      assert.equal(payload.chatId, 'wxid_a')
+      assert.ok(payload.messages.length >= 1, 'messages missing')
+      assert.equal(payload.messages[0].chatId, 'wxid_a')
+    })
+  })
+  await check('chats 限流参数被夹住（limit=99999 不炸）', () => panelGet('/wechat/api/chats?chatId=wxid_a&limit=99999').then((res) => {
+    assert.equal(res.status, 200)
+    assert.ok(res.json().messages.length <= 200)
+  }))
+
+  // read
+  const read = await panelSend('/wechat/api/read', 'POST', { chatId: 'wxid_a' })
+  await check('read 提交已读水位', () => {
+    assert.equal(read.status, 200)
+    assert.equal(read.json().ok, true)
+    assert.equal(typeof read.json().readThroughSeq, 'number')
+    assert.equal(read.json().unreadCount, 0)
+  })
+  await check('read 缺 chatId 时 400', () => panelSend('/wechat/api/read', 'POST', {}).then((res) => {
+    assert.equal(res.status, 400)
+    assert.equal(res.json().ok, false)
+  }))
+
+  // config
+  await check('config GET 给脱敏配置', () => {
+    return panelGet('/wechat/api/config').then((res) => {
+      const payload = res.json()
+      assert.equal(res.status, 200)
+      assert.equal(payload.ok, true)
+      assert.equal(payload.config.gateway.sharedSecretSet, true)
+      assert.ok(!res.raw.includes('sekret'))
+    })
+  })
+  const wrote = await panelSend('/wechat/api/config', 'PUT', { config: { 'reply.prefix': '【T】', 'gateway.sendUrl': 'http://127.0.0.1:9998/send' } })
+  await check('config PUT 热点键立即生效', () => {
+    assert.equal(wrote.status, 200)
+    const payload = wrote.json()
+    assert.equal(payload.ok, true)
+    assert.deepEqual(payload.applied.sort(), ['gateway.sendUrl', 'reply.prefix'])
+    assert.deepEqual(payload.restart, [])
+    assert.deepEqual(payload.rejected, [])
+  })
+  await check('config PUT 真的改到了运行态', () => {
+    return panelGet('/wechat/api/config').then((res) => {
+      const config = res.json().config
+      assert.equal(config.prefix, '【T】')
+      assert.equal(config.gateway.sendUrl, 'http://127.0.0.1:9998/send')
+    })
+  })
+  await check('config PUT 写进了覆盖值文件', () => {
+    const written = JSON.parse(readFileSync(OVERRIDE_FILE, 'utf8'))
+    assert.equal(written.reply.prefix, '【T】')
+    assert.equal(written.gateway.sendUrl, 'http://127.0.0.1:9998/send')
+  })
+  await check('config PUT 拒绝不认识的键', () => panelSend('/wechat/api/config', 'PUT', { config: { 'nope.field': 1 } }).then((res) => {
+    assert.deepEqual(res.json().rejected, ['nope.field'])
+  }))
+  await check('config PUT 重启键被归类为 restart', () => panelSend('/wechat/api/config', 'PUT', { config: { webhookPath: '/wechat/webhook-next' } }).then((res) => {
+    assert.deepEqual(res.json().restart, ['webhookPath'])
+    assert.equal(res.json().applied.length, 0)
+  }))
+  await check('config PUT action=reset 清空覆盖值', async () => {
+    const res = await panelSend('/wechat/api/config', 'PUT', { action: 'reset' })
+    assert.equal(res.json().reset, true)
+    assert.deepEqual(readOverride(OVERRIDE_FILE), {})
+  })
+  await check('config PUT 非法 JSON 时 400', () => {
+    const route = webRoutes.get('/wechat/api/config')
+    const req = new EventEmitter()
+    req.method = 'PUT'
+    req.url = '/wechat/api/config'
+    req.headers = {}
+    req.socket = { remoteAddress: '127.0.0.1' }
+    req.destroy = () => {}
+    const res = { statusCode: 0, headers: {}, writableEnded: false, body: '' }
+    res.setHeader = (k, v) => { res.headers[k.toLowerCase()] = v }
+    res.end = (chunk) => { res.writableEnded = true; res.body = chunk ?? '' }
+    const done = route.handler(req, res)
+    req.emit('data', Buffer.from('{not json'))
+    req.emit('end')
+    return done.then(() => {
+      assert.equal(res.statusCode, 400)
+      assert.equal(JSON.parse(res.body).code, 'invalid-json')
+    })
+  })
+
+  // console
+  await check('console inbound 造一条入站消息', () => panelSend('/wechat/api/console', 'POST', {
+    action: 'inbound', chatId: 'wxid_panel', text: '面板造的消息',
+  }).then((res) => {
+    const payload = res.json()
+    assert.equal(payload.ok, true)
+    assert.equal(payload.chatId, 'wxid_panel')
+    assert.ok(String(payload.detail ?? '').length > 0, 'detail missing')
+  }))
+  await check('console outbound 投递到网关', () => panelSend('/wechat/api/console', 'POST', {
+    action: 'outbound', chatId: 'wxid_panel', text: '面板发的消息',
+  }).then((res) => {
+    assert.equal(res.json().ok, true)
+    const hit = sent.filter((s) => s.url === 'http://127.0.0.1:9998/send')
+    assert.ok(hit.length >= 1, 'gateway not called')
+    assert.equal(hit[hit.length - 1].body.text, '面板发的消息')
+  }))
+  await check('console 未知动作 400', () => panelSend('/wechat/api/console', 'POST', { action: 'nope' }).then((res) => {
+    assert.equal(res.status, 400)
+    assert.equal(res.json().code, 'unknown-action')
+  }))
+  await check('console stub-start / stub-stop 起停网关桩', async () => {
+    // 端口交给系统分配：固定 18787 在别人的机器上可能已经被占用
+    const probe = createServer()
+    await new Promise((resolve, reject) => {
+      probe.once('error', reject)
+      probe.listen(0, '127.0.0.1', resolve)
+    })
+    const port = probe.address().port
+    await new Promise((resolve) => probe.close(resolve))
+    const started = await panelSend('/wechat/api/console', 'POST', { action: 'stub-start', port })
+    assert.equal(started.json().ok, true)
+    assert.equal(started.json().running, true)
+    assert.equal(started.json().port, port)
+    const stopped = await panelSend('/wechat/api/console', 'POST', { action: 'stub-stop' })
+    assert.equal(stopped.json().running, false)
+  })
+  await check('console stub-start 非法端口报错但不崩', () => panelSend('/wechat/api/console', 'POST', { action: 'stub-start', port: 99999 }).then((res) => {
+    assert.equal(res.json().ok, false)
+    assert.match(String(res.json().message), /端口/)
+  }))
+
+  // selftest
+  const selftest = await panelSend('/wechat/api/selftest', 'POST', {})
+  await check('selftest 跑完 7 项并给出汇总', () => {
+    const payload = selftest.json()
+    assert.equal(payload.ok, true)
+    assert.ok(Array.isArray(payload.checks), 'checks missing')
+    assert.equal(payload.checks.length, 7)
+    assert.equal(payload.summary.total, 7)
+    assert.equal(payload.summary.passed + payload.summary.failed, 7)
+    for (const item of payload.checks) {
+      assert.ok(item.id && item.title, `check item malformed: ${JSON.stringify(item)}`)
+      assert.ok(['ok', 'warn', 'error'].includes(item.level), `bad level: ${item.level}`)
+    }
+  })
+  await check('selftest 每项失败都带修法', () => {
+    const failed = selftest.json().checks.filter((c) => c.level !== 'ok')
+    for (const item of failed) assert.ok(item.fix, `${item.id} 缺 fix`)
+  })
+  await check('selftest 只认 POST', () => panelGet('/wechat/api/selftest').then((res) => assert.equal(res.status, 405)))
+
+  // reset
+  await check('reset 清空本地缓存', () => panelSend('/wechat/api/reset', 'POST', {}).then((res) => {
+    assert.equal(res.json().ok, true)
+  }))
+  await check('reset 之后 state 里会话为空', () => panelGet('/wechat/api/state').then((res) => {
+    const payload = res.json()
+    assert.equal(payload.chats.length, 0)
+    assert.equal(payload.sessions, 0)
+    assert.equal(payload.memory.impressions, 0)
+    // counters 是累计统计，reset() 只清缓存不清计数（以 index.js 的实现为准）
+    assert.ok(payload.counters.inbound >= 1, 'counters 不该被 reset 清零')
+  }))
+  await check('reset 之后消息缓存也空了', () => panelGet('/wechat/api/chats?chatId=wxid_a').then((res) => {
+    assert.deepEqual(res.json().messages, [])
+    assert.equal(res.json().unread, 0)
+  }))
+
+  // state 里的事件流确实记录了刚才的动作
+  await check('事件流记录了面板动作', () => panelGet('/wechat/api/state').then((res) => {
+    const events = res.json().events
+    assert.ok(events.length > 0, 'no events')
+    assert.ok(events.some((e) => /面板写入配置/.test(e.message)), 'config write not logged')
+    assert.ok(events.some((e) => /入站自测/.test(e.message)), 'inbound not logged')
+    for (const event of events) {
+      assert.ok(['info', 'warn', 'error'].includes(event.level), `bad event level: ${event.level}`)
+    }
+  }))
+})()
+
+rmSync(OVERRIDE_FILE, { force: true })
+
+console.log('\n[8] 日志')
 for (const line of logs) console.log(`  · ${line}`)
 
 console.log(failures === 0 ? '\n全部通过 ✅\n' : `\n${failures} 项失败 ❌\n`)
