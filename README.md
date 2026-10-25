@@ -245,6 +245,7 @@ dsh-wechat/
 │  ├─ build-preset.mjs           md → preset patch
 │  ├─ selftest.mjs               离线自检（假 ctx + harness 真校验器）
 │  ├─ verify-client.mjs          面板 SSR 冒烟测试（不需要浏览器）
+│  ├─ verify-client-states.mjs   词典完整性 + 异常快照渲染测试
 │  ├─ fixtures/snapshot.json     面板测试用的快照样本
 │  ├─ recv.mjs                   本地网关桩（独立进程版）
 │  ├─ peek.mjs                   会话日志（多帧 zstd）读取器
