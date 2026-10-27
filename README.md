@@ -271,7 +271,8 @@ node scripts\build-preset.mjs --check  # 校验没漂移
 - 最终文本以 `raw:true` **原样**投递到网关桩（`text` 一个字没改）；
 - 改配置后热点重载生效（autoReply 开关、kind 切换）；
 - 公众号签名验签（GET echostr 原文返回、错误签名 403）+ XML 入站解析；
-- 个人微信 hook 全链路（真 HTTP、真网关）：`/mock/push` → 轮询拉取入库 → agent → `POST /send` → `/mock/out` 读回原文；含 401、去重、`selfIds` 过滤、游标增量。
+- 个人微信 hook 全链路（真 HTTP、真网关）：`/mock/push` → 轮询拉取入库 → agent → `POST /send` → `/mock/out` 读回原文；含 401、去重、`selfIds` 过滤、游标增量；
+- hook 在**运行中的 DSH 里**跑通（v0.3.0）：`scenario-d` 一键脚本实测 agent 回复「在，说。」经网关 `/send` 收到；面板 `/api/console` 的 `hook-poll / hook-stop / hook-start / hook-reset-cursor` 与 `wechat_hook` 工具均按预期工作。
 
 **未验证**：真实微信侧网关（WeChatFerry / Gewechat / 公众号后台）。插件只约定协议，不含任何 hook 实现。
 
