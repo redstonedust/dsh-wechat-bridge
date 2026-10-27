@@ -34,6 +34,12 @@
           hookDll: ''
           timeoutMs: 15000
           waitForServiceMs: 20000
+          # 注入前先探测客户端（家族/版本/架构），并按版本自动解析 DLL
+          autoDetect: true
+          detectScript: ./native/detect-wechat.mjs
+          resolveScript: ./native/resolve-hook-dll.mjs
+          # 版本化 DLL 仓库：sdk-<版本>.dll 或 hook-catalog.json
+          dllDir: ./native/hook-dlls
         hook:
           # kind=hook 时生效：插件从 baseUrl 拉 /messages，往 /send 发
           baseUrl: ''

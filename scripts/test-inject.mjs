@@ -86,7 +86,7 @@ rmSync(stateFile, { force: true })
 apply(makeCtx(), {
   kind: 'hook',
   hook: { baseUrl: '', autoStart: false },
-  inject: { injectorPath: injector, processName: 'test-target.exe', hookDll: payload, timeoutMs: 10000, waitForServiceMs: 0 },
+  inject: { injectorPath: injector, processName: 'test-target.exe', hookDll: payload, timeoutMs: 10000, waitForServiceMs: 0, autoDetect: false },
   reply: { autoReply: true, mode: 'raw', agentPreset: 'wechat-agent' },
   stateFile,
   debug: false,
@@ -139,7 +139,7 @@ try {
     apply(makeCtx(), {
       kind: 'hook',
       hook: { baseUrl: '', autoStart: false },
-      inject: { injectorPath: injector, processName: 'definitely-not-running.exe', hookDll: payload, timeoutMs: 8000 },
+      inject: { injectorPath: injector, processName: 'definitely-not-running.exe', hookDll: payload, timeoutMs: 8000, autoDetect: false },
       stateFile: join(tmpdir(), `wechat-inject-test-missing-${process.pid}.json`),
       debug: false,
     })

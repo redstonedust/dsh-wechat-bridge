@@ -730,6 +730,7 @@ await (async () => {
     assert.match(String(resumed.detail ?? ''), /恢复/)
   })
   await callPause({ action: 'stop' })
+
 })()
 
 console.log('\n[9] 注入微信（用假的注入器脚本验证编排）')
@@ -749,7 +750,7 @@ await (async () => {
   apply(injectCtx, {
     kind: 'hook',
     hook: { baseUrl: 'http://127.0.0.1:1', secret: 'x', autoStart: false },
-    inject: { injectorPath: injectorScript, processName: 'WeChat.exe', hookDll: fakeDll, timeoutMs: 5000, waitForServiceMs: 0 },
+    inject: { injectorPath: injectorScript, processName: 'WeChat.exe', hookDll: fakeDll, timeoutMs: 5000, waitForServiceMs: 0, autoDetect: false },
     reply: { autoReply: true, mode: 'raw', agentPreset: 'wechat-agent' },
     stateFile: join(tmpdir(), `wechat-inject-selftest-${process.pid}.json`),
     debug: false,
@@ -774,7 +775,7 @@ await (async () => {
   apply(brokenCtx, {
     kind: 'hook',
     hook: { baseUrl: '', autoStart: false },
-    inject: { injectorPath: join(tmpdir(), 'definitely-missing-injector.exe'), hookDll: fakeDll },
+    inject: { injectorPath: join(tmpdir(), 'definitely-missing-injector.exe'), hookDll: fakeDll, autoDetect: false },
     stateFile: join(tmpdir(), `wechat-inject-selftest-broken-${process.pid}.json`),
   })
   const brokenTool = registrations.tools.slice(beforeBroken).find((tool) => tool.name === 'wechat_hook')
@@ -783,6 +784,23 @@ await (async () => {
     assert.equal(broken.ok, false)
     assert.match(String(broken.detail ?? ''), /injector-missing|找不到注入器/)
   })
+  // 自动探测：本机要么没有微信、要么是 4.x（无可用 hook）——两种情况都必须给出明确判定，
+  // 而不是拿一个不匹配的 DLL 硬注。
+  const autoCtx = makeCtx(services)
+  const beforeAuto = registrations.tools.length
+  apply(autoCtx, {
+    kind: 'hook',
+    hook: { baseUrl: '', autoStart: false },
+    inject: { injectorPath: injectorScript, timeoutMs: 3000, autoDetect: true },
+    stateFile: join(tmpdir(), `wechat-auto-selftest-${process.pid}.json`),
+  })
+  const autoHook = registrations.tools.slice(beforeAuto).find((tool) => tool.name === 'wechat_hook')
+  const auto = await autoHook.execute({ action: 'inject' }, { agent: undefined, signal: new AbortController().signal })
+  check('autoDetect 会先探测客户端并给出可执行判定', () => {
+    assert.equal(auto.ok, false)
+    assert.match(String(auto.detail ?? ''), /client-missing|unsupported-client|dll-missing|没找到|没有公开可用/)
+  })
+
 })()
 
 rmSync(OVERRIDE_FILE, { force: true })

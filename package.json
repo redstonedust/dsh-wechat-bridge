@@ -35,7 +35,9 @@
     "selftest": "node scripts/selftest.mjs",
     "test:hook": "node scripts/test-hook-gateway.mjs && node scripts/test-hook-integration.mjs",
     "test:inject": "node scripts/test-inject.mjs",
-    "test": "node scripts/selftest.mjs && node scripts/test-hook-gateway.mjs && node scripts/test-hook-integration.mjs && node scripts/test-inject.mjs"
+    "test": "node scripts/selftest.mjs && node scripts/test-hook-gateway.mjs && node scripts/test-hook-integration.mjs && node scripts/test-inject.mjs",
+    "test:detect": "node scripts/test-detect-resolve.mjs",
+    "setup:hook": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/setup-hook.ps1"
   },
   "dsh": {
     "bundle": {

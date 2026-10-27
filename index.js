@@ -72,6 +72,14 @@ const DEFAULTS = {
     timeoutMs: 15000,
     /** 注入成功后等 hook 服务可用的时长（毫秒）；0=不等。 */
     waitForServiceMs: 20000,
+    /** 注入前先探测客户端（家族/版本/架构），并按版本解析 DLL；关掉则直接用 hookDll。 */
+    autoDetect: true,
+    /** 探测脚本（相对插件包目录）。 */
+    detectScript: './native/detect-wechat.mjs',
+    /** 版本 → DLL 解析脚本。 */
+    resolveScript: './native/resolve-hook-dll.mjs',
+    /** hook DLL 仓库目录（放 sdk-<版本>.dll 或 hook-catalog.json）。 */
+    dllDir: './native/hook-dlls',
   },
   hook: {
     /** hook 服务基地址，例如 http://127.0.0.1:8788（gateway/hook-gateway.mjs 默认就是这个）。 */
@@ -349,6 +357,7 @@ export function apply(ctx, config) {
     counters: { inbound: 0, outbound: 0, replies: 0, errors: 0 },
     lastError: null,
     inject: null,
+    detected: null,
   }
 
   const restore = readJson(stateFile)
@@ -360,6 +369,7 @@ export function apply(ctx, config) {
       if (restore.memory && typeof restore.memory === 'object') state.memory = { ...state.memory, ...restore.memory }
       if (restore.lastError && typeof restore.lastError === 'object') state.lastError = restore.lastError
       if (restore.inject && typeof restore.inject === 'object') state.inject = restore.inject
+      if (restore.detected && typeof restore.detected === 'object') state.detected = restore.detected
       state.seq = Number.isSafeInteger(restore.seq) ? restore.seq : 0
     } catch (error) {
       log('warn', `state restore failed: ${error?.message ?? error}`)
@@ -381,6 +391,7 @@ export function apply(ctx, config) {
           memory: state.memory,
           lastError: state.lastError,
           inject: state.inject,
+          detected: state.detected,
         }, null, 0))
       } catch (error) {
         log('warn', `state persist failed: ${error?.message ?? error}`)
@@ -835,6 +846,14 @@ export function apply(ctx, config) {
   // ── 注入：把 hook DLL 送进微信进程 ──────────────────────────────────────
   // 个人微信的消息能力全部来自那个 DLL。注入器本体在 native/（win32，C 编译），
   // 插件只负责：找/拉起微信 → 调注入器 → 等 hook 服务起来 → 开始轮询。
+  /** 把 ./xxx 这类相对路径按插件包目录解析。 */
+  const resolvePluginPath = (raw) => {
+    const text = String(raw ?? '')
+    if (!text) return ''
+    if (isAbsolute(text)) return text
+    return join(pluginRoot, text.startsWith('./') ? text.slice(2) : text)
+  }
+
   const injectorFile = () => {
     const raw = String(cfg.inject.injectorPath ?? '')
     if (!raw) return ''
@@ -849,6 +868,8 @@ export function apply(ctx, config) {
     wechatPath: cfg.inject.wechatPath,
     hookDll: cfg.inject.hookDll,
     hookDllExists: Boolean(cfg.inject.hookDll) && existsSync(cfg.inject.hookDll),
+    autoDetect: cfg.inject.autoDetect !== false,
+    dllDir: resolvePluginPath(cfg.inject.dllDir),
     ...(state.inject ? { last: state.inject } : {}),
   })
 
@@ -866,15 +887,87 @@ export function apply(ctx, config) {
     const injector = injectorFile()
     if (!injector) return { ok: false, code: 'not-configured', message: 'inject.injectorPath 没配置' }
     if (!existsSync(injector)) return { ok: false, code: 'injector-missing', message: `找不到注入器：${injector}（先跑 native/build.ps1）` }
-    if (!cfg.inject.hookDll) return { ok: false, code: 'dll-missing', message: 'inject.hookDll 没配置：那是与微信版本匹配的 hook DLL' }
-    if (!existsSync(cfg.inject.hookDll)) return { ok: false, code: 'dll-missing', message: `找不到 DLL：${cfg.inject.hookDll}` }
 
+    // ── 1) 先探测客户端，再按版本解析 DLL ────────────────────────────────
+    // 不做这一步就会出现「拿一个不匹配的 DLL 硬注进去 → 微信崩」，
+    // 所以默认 autoDetect，探测脚本直接给出「能不能注入」的判定。
+    let detected
+    let dll = String(cfg.inject.hookDll ?? '').trim()
+    let processName = String(cfg.inject.processName ?? 'WeChat.exe')
+    let resolved
+    const lastJson = (text) => {
+      const line = String(text ?? '').split('\n').map((item) => item.trim()).filter(Boolean).pop() ?? ''
+      try { return JSON.parse(line) } catch { return undefined }
+    }
+
+    if (cfg.inject.autoDetect !== false) {
+      const detectScript = resolvePluginPath(cfg.inject.detectScript)
+      if (detectScript && existsSync(detectScript)) {
+        try {
+          const outcome = await runFile(process.execPath, [detectScript, '--json'], 30000)
+          detected = lastJson(outcome.stdout)
+          if (detected) {
+            state.detected = { at: Date.now(), ...detected }
+            persist()
+          }
+        } catch (error) {
+          debug(`detect failed: ${error?.message ?? error}`)
+        }
+      }
+      if (detected) {
+        if (detected.found === false) {
+          return { ok: false, code: 'client-missing', message: String(detected.reason ?? '没有找到微信客户端'), detected }
+        }
+        if (detected.strategy !== 'wcferry-dll') {
+          const tips = (detected.alternatives ?? []).join(' / ')
+          const message = [String(detected.reason ?? '').replace(/\s+/g, ' ').trim(), tips ? `可以：${tips}` : ''].filter(Boolean).join(' ')
+          state.inject = { at: Date.now(), ok: false, code: 'unsupported-client', message, detected }
+          persist()
+          log('warn', `注入不可用：${message}`)
+          return { ok: false, code: 'unsupported-client', message, detected, alternatives: detected.alternatives ?? [] }
+        }
+        if (detected.processName) processName = detected.processName
+        if (detected.arch && detected.arch !== 'x64' && detected.arch !== 'unknown') {
+          debug(`目标架构 ${detected.arch}：需要对应架构的注入器`)
+        }
+        if (!dll) {
+          const resolveScript = resolvePluginPath(cfg.inject.resolveScript)
+          if (resolveScript && existsSync(resolveScript)) {
+            try {
+              const outcome = await runFile(process.execPath, [
+                resolveScript, '--version', String(detected.version ?? ''), '--dir', resolvePluginPath(cfg.inject.dllDir), '--json',
+              ], 30000)
+              resolved = lastJson(outcome.stdout)
+              if (resolved?.ok) dll = String(resolved.dllPath ?? '')
+            } catch (error) {
+              debug(`resolve failed: ${error?.message ?? error}`)
+            }
+          }
+        }
+      }
+    }
+
+    if (!dll) {
+      const hint = detected ? `与 ${detected.version} 匹配的 DLL` : 'hook DLL'
+      return {
+        ok: false,
+        code: 'dll-missing',
+        message: `没找到${hint}：放到 ${resolvePluginPath(cfg.inject.dllDir)} 下（sdk-<版本>.dll 或 hook-catalog.json），或填 inject.hookDll`,
+        detected,
+        resolved,
+      }
+    }
+    if (!existsSync(dll)) {
+      return { ok: false, code: 'dll-missing', message: `找不到 DLL：${dll}`, detected }
+    }
+
+    // ── 2) 需要的话先把微信拉起来 ────────────────────────────────────────
     let launched = false
     if (cfg.inject.wechatPath) {
       try {
-        const running = await runFile(process.platform === 'win32' ? 'tasklist' : 'ps', ['/FI', `IMAGENAME eq ${cfg.inject.processName}`], 8000).catch(() => undefined)
+        const running = await runFile(process.platform === 'win32' ? 'tasklist' : 'ps', ['/FI', `IMAGENAME eq ${processName}`], 8000).catch(() => undefined)
         const text = running ? running.stdout : ''
-        if (!text || !text.toLowerCase().includes(String(cfg.inject.processName).toLowerCase())) {
+        if (!text || !text.toLowerCase().includes(String(processName).toLowerCase())) {
           const child = spawn(cfg.inject.wechatPath, [], { detached: true, stdio: 'ignore', windowsHide: false })
           child.unref()
           launched = true
@@ -885,24 +978,22 @@ export function apply(ctx, config) {
       }
     }
 
+    // ── 3) 注入 ──────────────────────────────────────────────────────────
     let result
     try {
-      const outcome = await runFile(injector, ['--process', cfg.inject.processName, '--dll', cfg.inject.hookDll, '--json', '--timeout', String(Number(cfg.inject.timeoutMs) || 15000)], (Number(cfg.inject.timeoutMs) || 15000) + 8000)
-      const line = outcome.stdout.split('\n').map((item) => item.trim()).filter(Boolean).pop() ?? ''
-      try {
-        result = JSON.parse(line)
-      } catch {
-        result = { ok: false, code: 'bad-output', message: (line || outcome.stderr || '注入器没有输出').slice(0, 300) }
-      }
+      const outcome = await runFile(injector, ['--process', processName, '--dll', dll, '--json', '--timeout', String(Number(cfg.inject.timeoutMs) || 15000)], (Number(cfg.inject.timeoutMs) || 15000) + 8000)
+      const parsed = lastJson(outcome.stdout)
+      result = parsed ?? { ok: false, code: 'bad-output', message: (outcome.stderr || '注入器没有输出').slice(0, 300) }
     } catch (error) {
       result = { ok: false, code: 'injector-failed', message: String(error?.message ?? error).slice(0, 300) }
     }
 
-    state.inject = { at: Date.now(), launched, ...result }
-    if (result.ok) log('info', `已注入 ${cfg.inject.processName}（pid ${result.pid ?? '?'}）`)
+    state.inject = { at: Date.now(), launched, dll, processName, ...result, ...(detected ? { detected } : {}) }
+    if (result.ok) log('info', `已注入 ${processName}（pid ${result.pid ?? '?'}）`)
     else log('warn', `注入失败（${result.code ?? 'unknown'}）：${result.message ?? ''}`)
     persist()
 
+    // ── 4) 等 hook 服务起来，然后自动开始轮询 ────────────────────────────
     let service = { ready: false }
     if (result.ok && Number(cfg.inject.waitForServiceMs) > 0 && cfg.hook.baseUrl) {
       const deadline = Date.now() + Number(cfg.inject.waitForServiceMs)
@@ -919,7 +1010,7 @@ export function apply(ctx, config) {
         service.started = true
       }
     }
-    return { ...result, launched, service }
+    return { ...result, dll, launched, service, ...(detected ? { detected } : {}), ...(resolved ? { resolved } : {}) }
   }
 
   const hookStatus = () => ({
@@ -1418,6 +1509,7 @@ export function apply(ctx, config) {
           counters: state.counters,
           lastError: state.lastError,
           inject: state.inject,
+          detected: state.detected,
           persona: { injected: Boolean(personaText), chars: personaText.length },
         })
       },

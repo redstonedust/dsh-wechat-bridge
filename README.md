@@ -56,6 +56,43 @@ node gateway/hook-gateway.mjs --driver exec --port 8788 --secret change-me `
 细节（游标语义、字段映射、wcf 路径/方法名适配）见 [gateway/README.md](gateway/README.md)。
 面板「控制台 → 个人微信 Hook」可以看游标/最近错误、手动拉一次、随时开关轮询。
 
+### 一键接入：探测 → 选 DLL → 注入 → 起网关 → 写配置 → 自检
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\setup-hook.ps1
+#   或先看会做什么（不编译、不注入、不改配置）
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\setup-hook.ps1 -DryRun
+```
+
+脚本会**先探测再决定**，不会拿一个不匹配的 DLL 硬注：
+
+| 探测结果 | 判定 | 一键脚本的行为 |
+|---|---|---|
+| WeChat **3.9.x**（`WeChat.exe`） | `wcferry-dll` | 按版本解析 DLL → 编译注入器（没编过才编）→ 注入 → 起网关 → 写插件配置 → 自检 |
+| Weixin **4.x**（`Weixin.exe`） | `unsupported` | **拒绝注入**，打印原因与替代路线后退出（exit 2） |
+| 没装微信 | `none` | 提示先安装 |
+
+**为什么 4.x 不行（实测，不是猜）**：Weixin 4.x 是另一套客户端；公开的 hook DLL 生态只覆盖 3.9.x，
+而它的界面是 Qt 自绘——UIA 探针在这台机器上只数到 **24 个后代节点**（全 Group/Button/Text，**没有 List/Edit**），
+所以既没有可注入的 DLL，也无法用 UI Automation 读会话。
+
+两条真正能用的路线：
+
+1. **装一个微信 3.9.x**（可与 4.x 共存，装到别的目录）→ 重跑 `setup-hook.ps1`，全功能注入；
+2. **走官方通道**：公众号 / 企业微信 / 微信客服（本插件 `kind=official` / `wecom` 已支持）。
+
+### 版本适配是怎么做的
+
+```
+native/detect-wechat.mjs     注册表 + 常见路径 + PE 头 → 家族/版本/架构/进程/窗口 → 判定 strategy
+native/resolve-hook-dll.mjs  版本 → native/hook-dlls/ 里的 DLL（精确 → 3.9.12.* → 3.9.* → 通配）
+                              可选 sha256 校验；没命中就告诉你「放成 sdk-<版本>.dll」
+native/probe-uia.ps1         只在需要评估 UI Automation 可行性时用（会数节点类型）
+```
+
+DLL 放法：`native/hook-dlls/sdk-3.9.12.17.dll`，或用 `hook-catalog.json` 登记（可带 sha256）。
+插件配置 `inject.autoDetect: true`（默认）后，面板点「注入微信」也会走同一套探测+解析。
+
 ### 注入微信
 
 个人微信的消息能力来自那个 **hook DLL**，而 DLL 要先被加载进微信进程。仓库自带一个 Win32 注入器：
