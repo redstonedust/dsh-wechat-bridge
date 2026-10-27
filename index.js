@@ -17,6 +17,7 @@
  *   - 状态（会话、消息、记忆）落在 stateFile，插件重载后仍在。
  */
 
+import { execFile, spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -57,6 +58,20 @@ const DEFAULTS = {
     token: '',
     /** wecom：群机器人 webhook。 */
     wecomWebhook: '',
+  },
+  inject: {
+    /** 注入器可执行文件；相对路径按插件包目录解析。.mjs/.js 会用当前 node 跑（便于自测）。 */
+    injectorPath: './native/build/wechat-inject.exe',
+    /** 目标进程名（不区分大小写）。 */
+    processName: 'WeChat.exe',
+    /** 可选：微信主程序路径；填了就先拉起再注入。 */
+    wechatPath: '',
+    /** 要注入的 hook DLL（例如 WeChatFerry 的 sdk.dll，必须与微信版本匹配）。 */
+    hookDll: '',
+    /** 注入器超时（毫秒）。 */
+    timeoutMs: 15000,
+    /** 注入成功后等 hook 服务可用的时长（毫秒）；0=不等。 */
+    waitForServiceMs: 20000,
   },
   hook: {
     /** hook 服务基地址，例如 http://127.0.0.1:8788（gateway/hook-gateway.mjs 默认就是这个）。 */
@@ -333,6 +348,7 @@ export function apply(ctx, config) {
     startedAt: Date.now(),
     counters: { inbound: 0, outbound: 0, replies: 0, errors: 0 },
     lastError: null,
+    inject: null,
   }
 
   const restore = readJson(stateFile)
@@ -343,6 +359,7 @@ export function apply(ctx, config) {
       for (const [chatId, sessionId] of Object.entries(restore.sessions ?? {})) state.sessions.set(chatId, sessionId)
       if (restore.memory && typeof restore.memory === 'object') state.memory = { ...state.memory, ...restore.memory }
       if (restore.lastError && typeof restore.lastError === 'object') state.lastError = restore.lastError
+      if (restore.inject && typeof restore.inject === 'object') state.inject = restore.inject
       state.seq = Number.isSafeInteger(restore.seq) ? restore.seq : 0
     } catch (error) {
       log('warn', `state restore failed: ${error?.message ?? error}`)
@@ -363,6 +380,7 @@ export function apply(ctx, config) {
           sessions: Object.fromEntries(state.sessions),
           memory: state.memory,
           lastError: state.lastError,
+          inject: state.inject,
         }, null, 0))
       } catch (error) {
         log('warn', `state persist failed: ${error?.message ?? error}`)
@@ -814,6 +832,96 @@ export function apply(ctx, config) {
     return false
   }
 
+  // ── 注入：把 hook DLL 送进微信进程 ──────────────────────────────────────
+  // 个人微信的消息能力全部来自那个 DLL。注入器本体在 native/（win32，C 编译），
+  // 插件只负责：找/拉起微信 → 调注入器 → 等 hook 服务起来 → 开始轮询。
+  const injectorFile = () => {
+    const raw = String(cfg.inject.injectorPath ?? '')
+    if (!raw) return ''
+    return isAbsolute(raw) ? raw : join(pluginRoot, raw.startsWith('./') ? raw.slice(2) : raw)
+  }
+
+  const injectStatus = () => ({
+    configured: Boolean(injectorFile() && cfg.inject.hookDll),
+    injectorPath: injectorFile(),
+    injectorExists: Boolean(injectorFile()) && existsSync(injectorFile()),
+    processName: cfg.inject.processName,
+    wechatPath: cfg.inject.wechatPath,
+    hookDll: cfg.inject.hookDll,
+    hookDllExists: Boolean(cfg.inject.hookDll) && existsSync(cfg.inject.hookDll),
+    ...(state.inject ? { last: state.inject } : {}),
+  })
+
+  const runFile = (file, args, timeoutMs) => new Promise((resolve, reject) => {
+    const isScript = /\.(mjs|cjs|js)$/i.test(file)
+    const command = isScript ? process.execPath : file
+    const argv = isScript ? [file, ...args] : args
+    execFile(command, argv, { timeout: timeoutMs, windowsHide: true, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
+      if (error && !stdout) { reject(error); return }
+      resolve({ stdout: String(stdout ?? ''), stderr: String(stderr ?? ''), exitCode: error?.code ?? 0 })
+    })
+  })
+
+  const injectWechat = async () => {
+    const injector = injectorFile()
+    if (!injector) return { ok: false, code: 'not-configured', message: 'inject.injectorPath 没配置' }
+    if (!existsSync(injector)) return { ok: false, code: 'injector-missing', message: `找不到注入器：${injector}（先跑 native/build.ps1）` }
+    if (!cfg.inject.hookDll) return { ok: false, code: 'dll-missing', message: 'inject.hookDll 没配置：那是与微信版本匹配的 hook DLL' }
+    if (!existsSync(cfg.inject.hookDll)) return { ok: false, code: 'dll-missing', message: `找不到 DLL：${cfg.inject.hookDll}` }
+
+    let launched = false
+    if (cfg.inject.wechatPath) {
+      try {
+        const running = await runFile(process.platform === 'win32' ? 'tasklist' : 'ps', ['/FI', `IMAGENAME eq ${cfg.inject.processName}`], 8000).catch(() => undefined)
+        const text = running ? running.stdout : ''
+        if (!text || !text.toLowerCase().includes(String(cfg.inject.processName).toLowerCase())) {
+          const child = spawn(cfg.inject.wechatPath, [], { detached: true, stdio: 'ignore', windowsHide: false })
+          child.unref()
+          launched = true
+          await new Promise((resolve) => setTimeout(resolve, 4000))
+        }
+      } catch (error) {
+        debug(`auto-launch failed: ${error?.message ?? error}`)
+      }
+    }
+
+    let result
+    try {
+      const outcome = await runFile(injector, ['--process', cfg.inject.processName, '--dll', cfg.inject.hookDll, '--json', '--timeout', String(Number(cfg.inject.timeoutMs) || 15000)], (Number(cfg.inject.timeoutMs) || 15000) + 8000)
+      const line = outcome.stdout.split('\n').map((item) => item.trim()).filter(Boolean).pop() ?? ''
+      try {
+        result = JSON.parse(line)
+      } catch {
+        result = { ok: false, code: 'bad-output', message: (line || outcome.stderr || '注入器没有输出').slice(0, 300) }
+      }
+    } catch (error) {
+      result = { ok: false, code: 'injector-failed', message: String(error?.message ?? error).slice(0, 300) }
+    }
+
+    state.inject = { at: Date.now(), launched, ...result }
+    if (result.ok) log('info', `已注入 ${cfg.inject.processName}（pid ${result.pid ?? '?'}）`)
+    else log('warn', `注入失败（${result.code ?? 'unknown'}）：${result.message ?? ''}`)
+    persist()
+
+    let service = { ready: false }
+    if (result.ok && Number(cfg.inject.waitForServiceMs) > 0 && cfg.hook.baseUrl) {
+      const deadline = Date.now() + Number(cfg.inject.waitForServiceMs)
+      const base = String(cfg.hook.baseUrl).replace(/\/+$/, '')
+      while (Date.now() < deadline) {
+        try {
+          const response = await fetch(`${base}/health`, { signal: AbortSignal.timeout(2000) })
+          if (response.ok) { service = { ready: true }; break }
+        } catch { /* 还没起来 */ }
+        await new Promise((resolve) => setTimeout(resolve, 600))
+      }
+      if (service.ready && cfg.kind === 'hook') {
+        if (!hookRuntime.running) startHook()
+        service.started = true
+      }
+    }
+    return { ...result, launched, service }
+  }
+
   const hookStatus = () => ({
     kind: cfg.kind,
     configured: hookReady(),
@@ -995,6 +1103,12 @@ export function apply(ctx, config) {
         maxMessages: cfg.history.maxMessages,
         debug: cfg.debug,
         // hook 配置同样只回「是否已设置」
+        inject: {
+          injectorPath: cfg.inject.injectorPath ?? '',
+          processName: cfg.inject.processName ?? '',
+          hookDll: cfg.inject.hookDll ?? '',
+          hookDllSet: Boolean(cfg.inject.hookDll),
+        },
         hook: {
           baseUrl: cfg.hook.baseUrl ?? '',
           secretSet: Boolean(cfg.hook.secret),
@@ -1015,6 +1129,7 @@ export function apply(ctx, config) {
       },
       autoReply: !autoReplyOff,
       hook: hookStatus(),
+      inject: injectStatus(),
       agentServices: Boolean(agentApi),
       presets: presets.list,
       presetsError: presets.error,
@@ -1162,6 +1277,8 @@ export function apply(ctx, config) {
     hookStop: () => stopHook(),
     hookPoll: () => pollHookOnce(),
     hookResetCursor: (cursor) => resetHookCursor(cursor),
+    injectStatus: () => injectStatus(),
+    injectWechat: () => injectWechat(),
 
     /** 清本地缓存（等同 /wechat reset），不动真实微信会话与 DSH session。 */
     reset: () => {
@@ -1291,6 +1408,7 @@ export function apply(ctx, config) {
           })),
           counters: state.counters,
           lastError: state.lastError,
+          inject: state.inject,
           persona: { injected: Boolean(personaText), chars: personaText.length },
         })
       },
@@ -1865,7 +1983,7 @@ export function apply(ctx, config) {
     name: 'wechat_hook',
     description: '个人微信 hook 的运行控制：status=看状态，start/stop=开关主动轮询，poll=立刻拉一次，reset-cursor=把游标归零（下次从最新开始）。只在 kind=hook 时有意义。',
     parameters: {
-      action: { type: 'string', required: true, enum: ['status', 'start', 'stop', 'poll', 'reset-cursor'], description: '要做的动作。' },
+      action: { type: 'string', required: true, enum: ['status', 'start', 'stop', 'poll', 'reset-cursor', 'inject'], description: '要做的动作；inject=把 hook DLL 注入微信进程（需要 native 注入器与匹配的 DLL）。' },
       cursor: { type: 'string', description: 'reset-cursor 时可指定新游标；省略=从最新开始。' },
     },
     output: {
@@ -1921,6 +2039,16 @@ export function apply(ctx, config) {
       if (action === 'stop') {
         stopHook()
         return { ok: true, ...base, running: false }
+      }
+      if (action === 'inject') {
+        const outcome = await injectWechat()
+        return {
+          ok: outcome.ok === true,
+          ...base,
+          running: hookRuntime.running,
+          ...(outcome.pid ? { detail: `已注入 pid ${outcome.pid}` } : {}),
+          ...(outcome.ok ? {} : { detail: `${outcome.code ?? 'error'}: ${outcome.message ?? ''}`.slice(0, 300) }),
+        }
       }
       if (action === 'reset-cursor') {
         const outcome = resetHookCursor(args?.cursor)

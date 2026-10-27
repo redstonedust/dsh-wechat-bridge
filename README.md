@@ -56,10 +56,56 @@ node gateway/hook-gateway.mjs --driver exec --port 8788 --secret change-me `
 细节（游标语义、字段映射、wcf 路径/方法名适配）见 [gateway/README.md](gateway/README.md)。
 面板「控制台 → 个人微信 Hook」可以看游标/最近错误、手动拉一次、随时开关轮询。
 
+### 注入微信
+
+个人微信的消息能力来自那个 **hook DLL**，而 DLL 要先被加载进微信进程。仓库自带一个 Win32 注入器：
+
+```powershell
+cd native
+powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1      # 需要 MinGW gcc（PATH 里）
+powershell -NoProfile -ExecutionPolicy Bypass -File test-inject.ps1 # 自测：注入到自己起的靶子进程
+```
+
+然后在面板「设置 → 网关 → 个人微信 Hook」里填两样东西：**hook DLL 路径**（例如 WeChatFerry 的 `sdk.dll`）和**进程名**（默认 `WeChat.exe`），
+再到「控制台 → 个人微信 Hook」点 **注入微信** —— 插件会：
+
+```
+调注入器（--process WeChat.exe --dll <你的 DLL> --json）
+  → 解析结果（pid / 架构 / 错误码）
+  → 等 <hook.baseUrl>/health 就绪（最长 inject.waitForServiceMs）
+  → 自动开始轮询
+```
+
+等价的两个入口：
+
+```powershell
+# 直接命令行注入（不经过插件）
+native\build\wechat-inject.exe --process WeChat.exe --dll C:\path\sdk.dll --json
+
+# 让 agent 自己做
+wechat_hook({ action: "inject" })
+```
+
+配置：
+
+```yaml
+inject:
+  injectorPath: ./native/build/wechat-inject.exe
+  processName: WeChat.exe
+  wechatPath: ''           # 填了就先拉起微信再注入
+  hookDll: 'C:\path\sdk.dll'
+  timeoutMs: 15000
+  waitForServiceMs: 20000
+```
+
+**注意**：DLL 必须与你本机微信版本、架构（32/64 位）匹配，不匹配会让微信直接崩；注入前微信要已登录；
+这套东西只在自己机器、自己的微信上用。
+
 ## 它做什么
 
 - **接微信**：四种网关——`generic`（自建网关 webhook）、`official`（公众号，含签名验签）、`wecom`（企微群机器人，只出站）、**`hook`（个人微信，插件主动轮询本机 hook 服务）**。
 - **个人微信 hook**：附带 [gateway/hook-gateway.mjs](gateway/hook-gateway.mjs)，把 WeChatFerry / 你自己的 hook 脚本收敛成统一协议；`mock` 驱动让你不装微信也能把全链路跑通。
+- **注入**：自带的 Win32 注入器（[native/](native/)）把 hook DLL 送进微信进程，面板一个按钮就能做「注入 → 等 hook 服务 → 开始轮询」。
 - **给 agent 一只手**：注册 12 个 `wechat_*` 工具（看消息、分条发、引用、@人、已读水位、轻量记忆、链路自检）。
 - **自动回复**：每个微信会话映射成一个独立 DSH 会话，跑 `wechat-agent` 模式（人格 markdown 注入），一轮结束把最终文本**原样**发回微信。
 - **两种输出模式**：没调发送工具 → 本轮最终文本原样转发；调了发送工具 → 文本只作思考（agent 自己控制发几条、发什么）。
@@ -244,7 +290,7 @@ node scripts\build-preset.mjs --check  # 校验没漂移
 | 工具 | 作用 |
 |---|---|
 | `wechat_status` | 网关/计数/未读/人格/最近错误 |
-| `wechat_hook` | 个人微信 hook 的 status / start / stop / poll / reset-cursor |
+| `wechat_hook` | 个人微信 hook：status / start / stop / poll / reset-cursor / **inject（注入微信）** |
 | `wechat_diagnose` | 自检自动回复链路：真建探针会话 + 投递一条，失败直说原因 |
 | `wechat_list_chats` | 会话列表（含未读、托管会话 id） |
 | `wechat_get_unread_messages` | 读未读（不自动已读） |
@@ -272,6 +318,8 @@ node scripts\build-preset.mjs --check  # 校验没漂移
 - 改配置后热点重载生效（autoReply 开关、kind 切换）；
 - 公众号签名验签（GET echostr 原文返回、错误签名 403）+ XML 入站解析；
 - 个人微信 hook 全链路（真 HTTP、真网关）：`/mock/push` → 轮询拉取入库 → agent → `POST /send` → `/mock/out` 读回原文；含 401、去重、`selfIds` 过滤、游标增量；
+- 注入器自测（native/test-inject.ps1）：64 位注入成功、靶子进程里出现 marker 文件、进程不存在时返回 `process-not-found`；
+- 插件的注入编排（selftest）：注入器输出解析、缺注入器/缺 DLL 的可操作报错；
 - hook 在**运行中的 DSH 里**跑通（v0.3.0）：`scenario-d` 一键脚本实测 agent 回复「在，说。」经网关 `/send` 收到；面板 `/api/console` 的 `hook-poll / hook-stop / hook-start / hook-reset-cursor` 与 `wechat_hook` 工具均按预期工作。
 
 **未验证**：真实微信侧网关（WeChatFerry / Gewechat / 公众号后台）。插件只约定协议，不含任何 hook 实现。
@@ -286,6 +334,13 @@ dsh-wechat/
 ├─ cordis.patch.yml              插件行 + 全量配置骨架
 ├─ presets/wechat-agent.patch.yml agent 模式（生成物）
 ├─ persona/wechat-persona.md     人格正文（唯一权威源）
+├─ native/
+│  ├─ wechat-inject.c           Win32 DLL 注入器（--process/--pid + --dll，输出 JSON）
+│  ├─ test-payload.c            自测用 DLL（往 %TEMP% 写一行证明注入成功）
+│  ├─ test-target.c             自测靶子进程
+│  ├─ build.ps1                 用 MinGW gcc 编译三个产物
+│  ├─ test-inject.ps1           注入自测（成功路径 + 进程不存在）
+│  └─ README.md                 用法与微信接入说明
 ├─ gateway/
 │  ├─ hook-gateway.mjs           个人微信 hook 适配网关（mock / wcf / exec 驱动）
 │  └─ README.md                  协议、驱动、字段映射
@@ -311,6 +366,7 @@ dsh-wechat/
 - 个人微信没有公开 API：需要一个本机 hook 服务（WeChatFerry / 自建）。本仓库提供的是**适配网关**（`gateway/`），不包含任何注入/hook 客户端本身。
 - 公众号客服消息有 48 小时窗口（`errcode 45015`），长期主动推送需要模板/订阅消息。
 - webhook 路由挂在 DSH 自己的监听上，没有额外鉴权；要公网访问请自建反代 + TLS，只放行 `/wechat/webhook*`。
+- 注入要自己准备**与微信版本匹配**的 hook DLL；本仓库不含任何 WeChat hook DLL，也不含绕过/反检测之类的东西。
 - agent 模式不是安全沙箱：preset 里挂的插件可以执行 Host 代码。
 
 ## License

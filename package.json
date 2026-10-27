@@ -25,7 +25,10 @@
     "scripts/*.mjs",
     "locale/*.json",
     "icon.svg",
-    "README.md"
+    "README.md",
+    "native/*.c",
+    "native/*.ps1",
+    "native/README.md"
   ],
   "scripts": {
     "build:preset": "node scripts/build-preset.mjs",

@@ -25,6 +25,15 @@
           token: ''
           # wecom 群机器人 webhook
           wecomWebhook: ''
+        inject:
+          # 把 hook DLL 注入微信进程（native/build/wechat-inject.exe）
+          injectorPath: ./native/build/wechat-inject.exe
+          processName: WeChat.exe
+          wechatPath: ''
+          # 与你的微信版本匹配的 hook DLL；留空=不注入
+          hookDll: ''
+          timeoutMs: 15000
+          waitForServiceMs: 20000
         hook:
           # kind=hook 时生效：插件从 baseUrl 拉 /messages，往 /send 发
           baseUrl: ''

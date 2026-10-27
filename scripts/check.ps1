@@ -30,27 +30,36 @@ try {
     Write-Host 'wechat-bridge 体检' -ForegroundColor Magenta
     Write-Host ''
 
-    Write-Step '1/5 语法'
+    Write-Step '1/6 语法'
     node --check index.js
     if ($LASTEXITCODE -ne 0) { Write-Fail 'index.js 语法错误'; $failed++ } else { Write-Ok 'index.js 语法通过' }
 
-    Write-Step '2/5 离线自检'
+    Write-Step '2/6 离线自检'
     node scripts/selftest.mjs | Select-Object -Last 3
     if ($LASTEXITCODE -ne 0) { Write-Fail 'selftest 未通过'; $failed++ } else { Write-Ok 'selftest 通过' }
 
-    Write-Step '3/5 hook 网关与全链路'
+    Write-Step '3/6 hook 网关与全链路'
     node scripts/test-hook-gateway.mjs | Select-Object -Last 2
     if ($LASTEXITCODE -ne 0) { Write-Fail 'hook-gateway 契约测试未通过'; $failed++ } else { Write-Ok 'hook-gateway 契约测试通过' }
     node scripts/test-hook-integration.mjs | Select-Object -Last 2
     if ($LASTEXITCODE -ne 0) { Write-Fail 'hook 全链路集成测试未通过'; $failed++ } else { Write-Ok 'hook 全链路集成测试通过' }
 
-    Write-Step '4/5 preset 一致性'
+    Write-Step '4/6 native 注入器（有编译产物才跑）'
+    $injector = Join-Path $root 'native\build\wechat-inject.exe'
+    if (Test-Path $injector) {
+        powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'native\test-inject.ps1') | Select-Object -Last 3
+        if ($LASTEXITCODE -ne 0) { Write-Fail 'native 注入自测未通过'; $failed++ } else { Write-Ok 'native 注入自测通过' }
+    } else {
+        Write-Warn '没有 native/build/wechat-inject.exe（先跑 native/build.ps1）；跳过'
+    }
+
+    Write-Step '5/6 preset 一致性'
     node scripts/build-preset.mjs --check
     if ($LASTEXITCODE -ne 0) { Write-Fail 'preset patch 与人格 md 不一致（跑 node scripts/build-preset.mjs）'; $failed++ }
     else { Write-Ok 'preset patch 与人格 md 一致' }
 
     if (-not $SkipOnline) {
-        Write-Step '5/5 线上状态'
+        Write-Step '6/6 线上状态'
         $originValue = Get-DshOrigin -Origin $Origin
         $status = Get-BridgeStatus -Origin $originValue
         if ($null -eq $status) {
@@ -66,7 +75,7 @@ try {
             if ($status.counters.errors -gt 0) { Write-Warn "已有 $($status.counters.errors) 次错误（不一定是问题，占位凭据也会计数）" }
         }
     } else {
-        Write-Step '5/5 线上状态（已跳过）'
+        Write-Step '6/6 线上状态（已跳过）'
     }
 } finally {
     Pop-Location

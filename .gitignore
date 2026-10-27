@@ -1,6 +1,9 @@
 # 依赖
 node_modules/
 
+# 本地编译产物（native/build.ps1 生成）
+native/build/
+
 # 本地联调产物
 .recv.log
 *.log

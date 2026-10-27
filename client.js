@@ -244,6 +244,18 @@ window.__ModuleLoader__.load({
       'console.hook.stop': '停止轮询',
       'console.hook.poll': '立即拉一次',
       'console.hook.reset': '游标归零',
+      'field.injectProcess': '微信进程名',
+      'field.injectProcessHint': '默认 WeChat.exe。注入是往这个进程里加载 DLL。',
+      'field.injectDll': 'hook DLL 路径',
+      'field.injectDllHint': '与你的微信版本匹配的 hook DLL（WeChatFerry 的 sdk.dll 之类）。DLL 版本不匹配会让微信崩，请自行确认。',
+      'field.injectDllEmpty': '（未设置）',
+      'field.injectorPath': '注入器路径',
+      'field.injectorPathHint': '默认 ./native/build/wechat-inject.exe（先跑 native/build.ps1 编译）。',
+      'console.hook.inject': '注入微信',
+      'console.hook.injected': '已注入 pid {pid}',
+      'console.hook.injectFail': '注入失败：{reason}',
+      'console.hook.injectHint': '注入器把 hook DLL 送进微信进程；DLL 必须与微信版本匹配，注入前微信要已登录。',
+      'console.hook.injectUnconfigured': '还没配注入器和 hook DLL（设置 → 网关 → 个人微信 Hook）。',
       'console.hook.done': '已执行',
       'console.hook.polled': '拉到 {added} 条，跳过 {skipped} 条',
       'field.kind.wecom': '企业微信群机器人',
@@ -499,6 +511,18 @@ window.__ModuleLoader__.load({
       'console.hook.stop': 'Stop polling',
       'console.hook.poll': 'Pull once now',
       'console.hook.reset': 'Reset cursor',
+      'field.injectProcess': 'WeChat process name',
+      'field.injectProcessHint': 'WeChat.exe by default. Injection loads the DLL into this process.',
+      'field.injectDll': 'Hook DLL path',
+      'field.injectDllHint': 'A hook DLL matching your WeChat build (e.g. WeChatFerry sdk.dll). A mismatched DLL crashes WeChat — verify before injecting.',
+      'field.injectDllEmpty': '(not set)',
+      'field.injectorPath': 'Injector path',
+      'field.injectorPathHint': 'Defaults to ./native/build/wechat-inject.exe (build it with native/build.ps1).',
+      'console.hook.inject': 'Inject into WeChat',
+      'console.hook.injected': 'Injected into pid {pid}',
+      'console.hook.injectFail': 'Injection failed: {reason}',
+      'console.hook.injectHint': 'The injector loads the hook DLL into the WeChat process. The DLL must match your WeChat build, and WeChat must already be signed in.',
+      'console.hook.injectUnconfigured': 'Injector and hook DLL are not configured yet (Settings → Gateway → Personal WeChat hook).',
       'console.hook.done': 'Done',
       'console.hook.polled': 'Pulled {added}, skipped {skipped}',
       'field.kind.wecom': 'WeCom group bot',
@@ -777,17 +801,23 @@ window.__ModuleLoader__.load({
 .wx-btn:active:not(:disabled) { transform: scale(0.97); }
 .wx-btn:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: 2px; }
 .wx-btn:disabled { opacity: 0.5; cursor: default; }
+.wx-btn--primary:disabled { background: var(--dsw-alias-button-primary-dimmed, var(--dsw-alias-brand-primary)); }
 .wx-btn--primary {
-  background: var(--dsw-alias-brand-primary);
+  /* 用宿主的主按钮配对 token：fill + label-primary-foreground。
+     --dsw-alias-brand-primary 是「强调色」，官方契约明确禁止拿它当填充+文字配对
+     （深色主题下 fill 与文字同为浅色 → 白底白字，按钮变成一块空白）。
+     老宿主没有这组 token 时，回退到 brand + 运行时算出的可读前景 --wx-on-brand。 */
+  background: var(--dsw-alias-button-primary-fill, var(--dsw-alias-brand-primary));
   border-color: transparent;
-  color: var(--dsw-alias-bg-base);
+  color: var(--dsw-alias-label-primary-foreground, var(--wx-on-brand, var(--dsw-alias-bg-base)));
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.16);
 }
 .wx-btn--quiet { background: transparent; border-color: transparent; color: var(--dsw-alias-label-secondary); }
 .wx-btn--sm { height: 25px; padding: 0 9px; font-size: 11.5px; border-radius: 7px; }
 .wx-btn--danger { color: var(--dsw-alias-state-error-primary); border-color: color-mix(in oklab, var(--dsw-alias-state-error-primary) 34%, var(--dsw-alias-border-l2)); background: transparent; }
 @media (hover: hover) and (pointer: fine) {
   .wx-btn:hover:not(:disabled) { background: var(--dsw-alias-bg-overlay); }
-  .wx-btn--primary:hover:not(:disabled) { filter: brightness(1.06); background: var(--dsw-alias-brand-primary); }
+  .wx-btn--primary:hover:not(:disabled) { background: var(--dsw-alias-button-primary-hover, var(--dsw-alias-brand-primary)); }
   .wx-btn--quiet:hover:not(:disabled) { background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary); }
   .wx-chat:hover { background: var(--dsw-alias-bg-layer-2); }
   .wx-copy:hover { color: var(--dsw-alias-label-primary); }
@@ -1012,6 +1042,7 @@ window.__ModuleLoader__.load({
 .wx-check-mark--error { color: var(--dsw-alias-state-error-primary); }
 .wx-check-body { flex: 1; min-width: 0; }
 .wx-check-title { font-size: 12.5px; font-weight: 550; }
+.wx-check-detail, .wx-check-fix { overflow-wrap: anywhere; }
 .wx-check-detail { font-size: 11.5px; color: var(--dsw-alias-label-secondary); overflow-wrap: anywhere; }
 .wx-check-fix {
   margin-top: 5px; font-size: 11.5px;
@@ -1266,6 +1297,36 @@ window.__ModuleLoader__.load({
         className: classes.join(' '),
         style: props.delay === undefined ? undefined : { animationDelay: props.delay + 'ms' },
       }, props.children);
+    }
+
+    /**
+     * 读当前主题的品牌色，算 WCAG 相对亮度，决定品牌底色上用深字还是白字。
+     * SSR（react-dom/server）里没有 document，直接返回空串走 CSS 兜底。
+     */
+    function computeBrandInk(element) {
+      try {
+        if (!element || typeof globalThis.getComputedStyle !== 'function' || !globalThis.document) return '';
+        const raw = String(globalThis.getComputedStyle(element).getPropertyValue('--dsw-alias-brand-primary') || '').trim();
+        if (raw === '') return '';
+        const probe = globalThis.document.createElement('span');
+        probe.style.color = raw;
+        probe.style.display = 'none';
+        globalThis.document.body.appendChild(probe);
+        const resolved = String(globalThis.getComputedStyle(probe).color || '');
+        probe.remove();
+        const match = /rgba?\(([^)]+)\)/.exec(resolved);
+        if (!match) return '';
+        const parts = match[1].split(',').map(function parse(piece) { return Number.parseFloat(piece); });
+        if (parts.length < 3 || parts.some(function bad(value) { return !Number.isFinite(value); })) return '';
+        const channel = function channel(value) {
+          const scaled = value / 255;
+          return scaled <= 0.03928 ? scaled / 12.92 : Math.pow((scaled + 0.055) / 1.055, 2.4);
+        };
+        const luminance = 0.2126 * channel(parts[0]) + 0.7152 * channel(parts[1]) + 0.0722 * channel(parts[2]);
+        return luminance > 0.55 ? '#12161c' : '#ffffff';
+      } catch (error) {
+        return '';
+      }
     }
 
     function CardHead(props) {
@@ -1815,6 +1876,8 @@ window.__ModuleLoader__.load({
       const config = isRecord(snap.config) ? snap.config : {};
       const gateway = isRecord(config.gateway) ? config.gateway : {};
       const hook = isRecord(snap.hook) ? snap.hook : {};
+      const inject = isRecord(snap.inject) ? snap.inject : {};
+      const injectLast = isRecord(inject.last) ? inject.last : {};
 
       const [chatId, setChatId] = React.useState('wechat-test');
       const [text, setText] = React.useState('面板里造的一条测试消息');
@@ -1882,7 +1945,9 @@ window.__ModuleLoader__.load({
         postJson(ROUTES.console, { action: action }).then(function done(result) {
           setHookBusy(false);
           if (result.ok) {
-            setHookNote(action === 'hook-poll'
+            setHookNote(action === 'hook-inject'
+              ? T('console.hook.injected', { pid: String(result.pid ?? '?') })
+              : action === 'hook-poll'
               ? T('console.hook.polled', { added: String(Number(result.accepted) || 0), skipped: String(Number(result.skipped) || 0) })
               : T('console.hook.done'));
             props.onRefresh();
@@ -2068,7 +2133,18 @@ window.__ModuleLoader__.load({
               ? h(Btn, { icon: 'stop', disabled: hookBusy, onClick: function stop() { onHook('hook-stop'); } }, T('console.hook.stop'))
               : h(Btn, { variant: 'primary', icon: 'play', disabled: hookBusy, onClick: function start() { onHook('hook-start'); } }, T('console.hook.start')),
             h(Btn, { icon: 'refresh', disabled: hookBusy, onClick: function poll() { onHook('hook-poll'); } }, T('console.hook.poll')),
-            h(Btn, { icon: 'alert', disabled: hookBusy, onClick: function reset() { onHook('hook-reset-cursor'); } }, T('console.hook.reset'))),
+            h(Btn, { icon: 'alert', disabled: hookBusy, onClick: function reset() { onHook('hook-reset-cursor'); } }, T('console.hook.reset')),
+            h(Btn, { icon: 'bolt', disabled: hookBusy, onClick: function injectNow() { onHook('hook-inject'); } }, T('console.hook.inject'))),
+          h('div', { className: 'wx-field-hint', style: { marginTop: '8px' } },
+            inject.configured
+              ? T('console.hook.injectHint')
+              : T('console.hook.injectUnconfigured')),
+          injectLast.at
+            ? h('div', { className: injectLast.ok ? 'wx-ok-line' : 'wx-error-line' },
+                injectLast.ok
+                  ? T('console.hook.injected', { pid: String(injectLast.pid ?? '?') })
+                  : T('console.hook.injectFail', { reason: String(injectLast.message ?? injectLast.code ?? 'unknown') }))
+            : null,
           hookNote ? h('div', { className: 'wx-ok-line' }, hookNote) : null,
           hookErr ? h('div', { className: 'wx-error-line' }, hookErr) : null));
     }
@@ -2109,7 +2185,13 @@ window.__ModuleLoader__.load({
         limit: String(Number(isRecord(config.hook) ? config.hook.limit : 0) || 50),
         selfIds: joinList(isRecord(config.hook) ? config.hook.selfIds : []),
       };
-      return { reply: reply, gateway: tap, hook: hook };
+      const injectCfg = isRecord(config.inject) ? config.inject : {};
+      const inject = {
+        injectorPath: asText(injectCfg.injectorPath),
+        processName: asText(injectCfg.processName) || 'WeChat.exe',
+        hookDll: '',
+      };
+      return { reply: reply, gateway: tap, hook: hook, inject: inject };
     }
 
     function SettingsTab(props) {
@@ -2183,6 +2265,15 @@ window.__ModuleLoader__.load({
             else patch['reply.' + key] = asText(value);
             continue;
           }
+          if (group === 'inject') {
+            if (key === 'hookDll') {
+              if (asText(value).trim() === '') continue;
+              patch['inject.hookDll'] = asText(value);
+            } else {
+              patch['inject.' + key] = asText(value);
+            }
+            continue;
+          }
           if (group === 'hook') {
             if (key === 'secret') {
               if (asText(value).trim() === '') continue;
@@ -2229,6 +2320,7 @@ window.__ModuleLoader__.load({
             next.reply = Object.assign({}, previous.reply);
             next.gateway = Object.assign({}, previous.gateway, { sharedSecret: '', appSecret: '', token: '' });
             next.hook = Object.assign({}, previous.hook, { secret: '' });
+            next.inject = Object.assign({}, previous.inject, { hookDll: '' });
             return next;
           });
           if (typeof props.onSaved === 'function') props.onSaved();
@@ -2423,6 +2515,27 @@ window.__ModuleLoader__.load({
                       value: draft.hook.selfIds,
                       placeholder: 'wxid_bot',
                       onChange: function change(event) { setField('hook', 'selfIds', event.target.value); },
+                    })),
+                  h(Field, { label: T('field.injectProcess'), hint: T('field.injectProcessHint') },
+                    h('input', {
+                      className: 'wx-input wx-mono',
+                      value: draft.inject.processName,
+                      placeholder: 'WeChat.exe',
+                      onChange: function change(event) { setField('inject', 'processName', event.target.value); },
+                    })),
+                  h(Field, { label: T('field.injectDll'), hint: T('field.injectDllHint') },
+                    h('input', {
+                      className: 'wx-input wx-mono',
+                      value: draft.inject.hookDll,
+                      placeholder: injectCfg.hookDllSet ? T('field.secretPlaceholder') : T('field.injectDllEmpty'),
+                      onChange: function change(event) { setField('inject', 'hookDll', event.target.value); },
+                    })),
+                  h(Field, { label: T('field.injectorPath'), hint: T('field.injectorPathHint') },
+                    h('input', {
+                      className: 'wx-input wx-mono',
+                      value: draft.inject.injectorPath,
+                      placeholder: './native/build/wechat-inject.exe',
+                      onChange: function change(event) { setField('inject', 'injectorPath', event.target.value); },
                     })))
               : null,
 
@@ -2596,6 +2709,8 @@ window.__ModuleLoader__.load({
       const aliveRef = React.useRef(true);
       const markRef = React.useRef(null);
       const tabsRef = React.useRef(null);
+      const rootRef = React.useRef(null);
+      const [brandInk, setBrandInk] = React.useState('');
 
       const requestRefresh = React.useCallback(function requestRefresh() {
         setReloadTick(function bump(value) { return value + 1; });
@@ -2606,6 +2721,20 @@ window.__ModuleLoader__.load({
         aliveRef.current = true;
         return function markDead() { aliveRef.current = false; };
       }, []);
+
+      /* 品牌色决定主按钮前景：浅色品牌用深字、深色品牌用白字（否则会出现空白按钮）。 */
+      React.useEffect(function syncBrandInk() {
+        const apply = function apply() {
+          const ink = computeBrandInk(rootRef.current);
+          setBrandInk(function keep(previous) { return ink === previous ? previous : ink; });
+        };
+        apply();
+        if (!globalThis.matchMedia) return undefined;
+        const query = globalThis.matchMedia('(prefers-color-scheme: dark)');
+        if (!query || typeof query.addEventListener !== 'function') return undefined;
+        query.addEventListener('change', apply);
+        return function cleanup() { query.removeEventListener('change', apply); };
+      }, [localeRevision]);
 
       /* 语言切换时重渲染（词典在 apply 里注册）。 */
       React.useEffect(function followLocale() {
@@ -2768,7 +2897,11 @@ window.__ModuleLoader__.load({
 
       if (snapshot === null) {
         const missing = failure !== null && failure.kind === 'missing';
-        return h('div', { className: 'wx-page' },
+        return h('div', {
+        className: 'wx-page',
+        ref: rootRef,
+        style: brandInk === '' ? undefined : { '--wx-on-brand': brandInk },
+      },
           h('div', { className: 'wx-card wx-fade', style: { display: 'flex', flexDirection: 'column', gap: '10px' } },
             h('div', { style: { display: 'flex', alignItems: 'center', gap: '9px' } },
               h(Icon, { name: missing ? 'alert' : 'clock', size: 15 }),
@@ -2826,7 +2959,11 @@ window.__ModuleLoader__.load({
         body = h(CheckTab, { onRefresh: requestRefresh });
       }
 
-      return h('div', { className: 'wx-page' },
+      return h('div', {
+        className: 'wx-page',
+        ref: rootRef,
+        style: brandInk === '' ? undefined : { '--wx-on-brand': brandInk },
+      },
         h('header', { className: 'wx-head wx-fade' },
           h('div', { className: 'wx-head-mark' }, h(Icon, { name: 'wechat', size: 20, bold: true })),
           h('div', { className: 'wx-head-text' },

@@ -13,7 +13,7 @@
  */
 import { pathToFileURL } from 'node:url'
 import { EventEmitter } from 'node:events'
-import { readFileSync, rmSync } from 'node:fs'
+import { readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -699,6 +699,59 @@ await (async () => {
   check('stop 之后 running=false', () => assert.equal(stopped.running, false))
   const reset = await run('wechat_hook', { action: 'reset-cursor', cursor: '' })
   check('reset-cursor 清空游标', () => assert.equal(reset.cursor, ''))
+})()
+
+console.log('\n[9] 注入微信（用假的注入器脚本验证编排）')
+await (async () => {
+  const injectorScript = join(tmpdir(), `wechat-fake-injector-${process.pid}.mjs`)
+  const fakeDll = join(tmpdir(), `wechat-fake-hook-${process.pid}.dll`)
+  writeFileSync(injectorScript, [
+    'const args = process.argv.slice(2)',
+    'const processName = args[args.indexOf("--process") + 1] ?? ""',
+    'const dll = args[args.indexOf("--dll") + 1] ?? ""',
+    'console.log(JSON.stringify({ ok: true, pid: 4242, process: processName, dll, injector: "x64", target: "x64" }))',
+  ].join('\n'), 'utf8')
+  writeFileSync(fakeDll, 'not-a-real-dll', 'utf8')
+
+  const injectCtx = makeCtx(services)
+  const beforeTools = registrations.tools.length
+  apply(injectCtx, {
+    kind: 'hook',
+    hook: { baseUrl: 'http://127.0.0.1:1', secret: 'x', autoStart: false },
+    inject: { injectorPath: injectorScript, processName: 'WeChat.exe', hookDll: fakeDll, timeoutMs: 5000, waitForServiceMs: 0 },
+    reply: { autoReply: true, mode: 'raw', agentPreset: 'wechat-agent' },
+    stateFile: join(tmpdir(), `wechat-inject-selftest-${process.pid}.json`),
+    debug: false,
+  })
+  const injectTools = registrations.tools.slice(beforeTools)
+  const hookTool = injectTools.find((tool) => tool.name === 'wechat_hook')
+  assert.ok(hookTool, 'hook 实例缺少 wechat_hook')
+  const run = () => hookTool.execute({ action: 'inject' }, { agent: undefined, signal: new AbortController().signal })
+
+  const outcome = await run()
+  check('注入器输出被解析成成功结果', () => {
+    assert.equal(outcome.ok, true)
+    assert.match(String(outcome.detail ?? ''), /4242/)
+  })
+
+  const status = await hookTool.execute({ action: 'status' }, { agent: undefined, signal: new AbortController().signal })
+  check('注入结果可从 wechat_hook 回读', () => assert.equal(status.kind, 'hook'))
+
+  // 注入器不存在时给出可操作错误
+  const brokenCtx = makeCtx(services)
+  const beforeBroken = registrations.tools.length
+  apply(brokenCtx, {
+    kind: 'hook',
+    hook: { baseUrl: '', autoStart: false },
+    inject: { injectorPath: join(tmpdir(), 'definitely-missing-injector.exe'), hookDll: fakeDll },
+    stateFile: join(tmpdir(), `wechat-inject-selftest-broken-${process.pid}.json`),
+  })
+  const brokenTool = registrations.tools.slice(beforeBroken).find((tool) => tool.name === 'wechat_hook')
+  const broken = await brokenTool.execute({ action: 'inject' }, { agent: undefined, signal: new AbortController().signal })
+  check('注入器缺失时失败且说明原因', () => {
+    assert.equal(broken.ok, false)
+    assert.match(String(broken.detail ?? ''), /injector-missing|找不到注入器/)
+  })
 })()
 
 rmSync(OVERRIDE_FILE, { force: true })
