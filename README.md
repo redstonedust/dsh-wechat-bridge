@@ -18,9 +18,48 @@
                                               任意 agent 会话
 ```
 
+## 个人微信（hook）
+
+个人微信没有公开 API，链路一定是「微信客户端 → 本机 hook 服务 → 插件」：
+
+```
+微信客户端 ──(注入/hook)──▶ hook 服务 ──(HTTP 轮询)──▶ dsh-wechat-bridge ──▶ DSH agent
+                                  ▲                              │
+                                  └────────(POST /send)──────────┘
+```
+
+插件侧只认两个端点，`gateway/hook-gateway.mjs` 负责跟真实 hook 打交道：
+
+```yaml
+config:
+  kind: hook
+  hook:
+    baseUrl: 'http://127.0.0.1:8788'
+    secret: 'change-me'
+    pollMs: 3000
+    selfIds: ['wxid_bot']    # 机器人自己的 wxid，防自问自答
+```
+
+```powershell
+# 不装微信，先把链路跑通（mock 驱动）
+node gateway/hook-gateway.mjs --driver mock --port 8788 --secret change-me
+
+# 接 WeChatFerry 的 HTTP 封装
+node gateway/hook-gateway.mjs --driver wcf --port 8788 --secret change-me --wcf-base http://127.0.0.1:9999
+
+# 接任何自己的 hook 脚本（stdout 出 JSON 即可）
+node gateway/hook-gateway.mjs --driver exec --port 8788 --secret change-me `
+  --get-cmd "python my_hook.py pull {{cursor}} {{limit}}" `
+  --send-cmd "python my_hook.py send {{chatId}} {{text}}"
+```
+
+细节（游标语义、字段映射、wcf 路径/方法名适配）见 [gateway/README.md](gateway/README.md)。
+面板「控制台 → 个人微信 Hook」可以看游标/最近错误、手动拉一次、随时开关轮询。
+
 ## 它做什么
 
-- **接微信**：在 DSH 自己的 webServer 上开一个 webhook 端点，收网关推送、把回复投回去。支持 `generic`（任意自建网关）、`official`（公众号，含签名验签）、`wecom`（企微群机器人，只出站）。
+- **接微信**：四种网关——`generic`（自建网关 webhook）、`official`（公众号，含签名验签）、`wecom`（企微群机器人，只出站）、**`hook`（个人微信，插件主动轮询本机 hook 服务）**。
+- **个人微信 hook**：附带 [gateway/hook-gateway.mjs](gateway/hook-gateway.mjs)，把 WeChatFerry / 你自己的 hook 脚本收敛成统一协议；`mock` 驱动让你不装微信也能把全链路跑通。
 - **给 agent 一只手**：注册 12 个 `wechat_*` 工具（看消息、分条发、引用、@人、已读水位、轻量记忆、链路自检）。
 - **自动回复**：每个微信会话映射成一个独立 DSH 会话，跑 `wechat-agent` 模式（人格 markdown 注入），一轮结束把最终文本**原样**发回微信。
 - **两种输出模式**：没调发送工具 → 本轮最终文本原样转发；调了发送工具 → 文本只作思考（agent 自己控制发几条、发什么）。
@@ -89,7 +128,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\scenario-c-official-
     -AppId wx1234567890abcdef -AppSecret <secret> -Token <token> `
     -PublicUrl https://bot.example.com/wechat/webhook -TestInbound
 
-# 体检：语法 + 离线自检 + preset 一致性 + 线上状态
+# D. 个人微信 hook：起 mock hook 网关 → 造好友消息 → 等 agent 回完发出去
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\scenario-d-personal-wechat-hook.ps1
+
+# 体检：语法 + 离线自检 + hook 契约/全链路 + preset 一致性 + 线上状态
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\check.ps1
 ```
 
@@ -202,6 +244,7 @@ node scripts\build-preset.mjs --check  # 校验没漂移
 | 工具 | 作用 |
 |---|---|
 | `wechat_status` | 网关/计数/未读/人格/最近错误 |
+| `wechat_hook` | 个人微信 hook 的 status / start / stop / poll / reset-cursor |
 | `wechat_diagnose` | 自检自动回复链路：真建探针会话 + 投递一条，失败直说原因 |
 | `wechat_list_chats` | 会话列表（含未读、托管会话 id） |
 | `wechat_get_unread_messages` | 读未读（不自动已读） |
@@ -227,7 +270,8 @@ node scripts\build-preset.mjs --check  # 校验没漂移
 - 按会话创建 `agentPreset: wechat-agent` 的 DSH 会话，模型跑到 `turn/end`；
 - 最终文本以 `raw:true` **原样**投递到网关桩（`text` 一个字没改）；
 - 改配置后热点重载生效（autoReply 开关、kind 切换）；
-- 公众号签名验签（GET echostr 原文返回、错误签名 403）+ XML 入站解析。
+- 公众号签名验签（GET echostr 原文返回、错误签名 403）+ XML 入站解析；
+- 个人微信 hook 全链路（真 HTTP、真网关）：`/mock/push` → 轮询拉取入库 → agent → `POST /send` → `/mock/out` 读回原文；含 401、去重、`selfIds` 过滤、游标增量。
 
 **未验证**：真实微信侧网关（WeChatFerry / Gewechat / 公众号后台）。插件只约定协议，不含任何 hook 实现。
 
@@ -241,6 +285,9 @@ dsh-wechat/
 ├─ cordis.patch.yml              插件行 + 全量配置骨架
 ├─ presets/wechat-agent.patch.yml agent 模式（生成物）
 ├─ persona/wechat-persona.md     人格正文（唯一权威源）
+├─ gateway/
+│  ├─ hook-gateway.mjs           个人微信 hook 适配网关（mock / wcf / exec 驱动）
+│  └─ README.md                  协议、驱动、字段映射
 ├─ scripts/
 │  ├─ build-preset.mjs           md → preset patch
 │  ├─ selftest.mjs               离线自检（假 ctx + harness 真校验器）
@@ -260,7 +307,7 @@ dsh-wechat/
 
 ## 限制
 
-- 个人微信没有公开 API：需要一个网关把消息推进来，本仓库不提供 hook。
+- 个人微信没有公开 API：需要一个本机 hook 服务（WeChatFerry / 自建）。本仓库提供的是**适配网关**（`gateway/`），不包含任何注入/hook 客户端本身。
 - 公众号客服消息有 48 小时窗口（`errcode 45015`），长期主动推送需要模板/订阅消息。
 - webhook 路由挂在 DSH 自己的监听上，没有额外鉴权；要公网访问请自建反代 + TLS，只放行 `/wechat/webhook*`。
 - agent 模式不是安全沙箱：preset 里挂的插件可以执行 Host 代码。

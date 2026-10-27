@@ -36,7 +36,13 @@ const TOKEN_REFRESH_MS = 7000 * 1000
 /** 配置默认值。用户配置按深合并覆盖。 */
 const DEFAULTS = {
   enabled: true,
-  /** 入站/出站网关类型：generic（任意自建网关）| official（微信公众平台）。 */
+  /**
+   * 网关类型：
+   *   generic  —— 自建网关推/收（webhook），插件被动
+   *   official —— 微信公众平台（XML + 签名验签）
+   *   wecom    —— 企业微信群机器人（只出站）
+   *   hook     —— 个人微信 hook 服务：插件**主动轮询**收消息、主动 POST 发消息
+   */
   kind: 'generic',
   webhookPath: '/wechat/webhook',
   gateway: {
@@ -51,6 +57,30 @@ const DEFAULTS = {
     token: '',
     /** wecom：群机器人 webhook。 */
     wecomWebhook: '',
+  },
+  hook: {
+    /** hook 服务基地址，例如 http://127.0.0.1:8788（gateway/hook-gateway.mjs 默认就是这个）。 */
+    baseUrl: '',
+    /** 与 hook 服务之间的共享密钥（请求头 X-WeChat-Secret）；留空不校验。 */
+    secret: '',
+    /** 轮询间隔（毫秒）。 */
+    pollMs: 3000,
+    /** 单次拉取条数上限。 */
+    limit: 50,
+    /** 起始游标；留空=从「现在」开始，避免把历史消息一次性灌进来。 */
+    cursor: '',
+    /** 单次 HTTP 超时（毫秒）。 */
+    timeoutMs: 8000,
+    /** 拉取路径（拼在 baseUrl 后面）。 */
+    messagesPath: '/messages',
+    /** 发送路径。 */
+    sendPath: '/send',
+    /** 机器人自己的 wxid / 昵称；来自这些 sender 的消息会被丢掉（防自问自答）。 */
+    selfIds: [],
+    /** 插件激活时自动开始轮询。 */
+    autoStart: true,
+    /** 连续失败多少次后自动暂停（0 = 永不暂停）。 */
+    maxFailures: 5,
   },
   reply: {
     /** 自动回复总开关（关掉后仅保留工具面，由 agent 用工具主动回）。 */
@@ -457,6 +487,31 @@ export function apply(ctx, config) {
         const ok = payload?.errcode === 0
         return { ok, detail: ok ? 'sent' : JSON.stringify(payload) }
       }
+      // hook：个人微信 hook 服务（主动 POST）
+      if (cfg.kind === 'hook') {
+        const base = String(cfg.hook.baseUrl ?? '').replace(/\/+$/, '')
+        if (!base) return { ok: false, detail: 'hook.baseUrl is not configured' }
+        const headers = { 'content-type': 'application/json' }
+        if (cfg.hook.secret) headers['x-wechat-secret'] = cfg.hook.secret
+        const response = await fetch(`${base}${cfg.hook.sendPath || '/send'}`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            chatId,
+            text: body,
+            replyToMessageId: meta.replyToMessageId,
+            atUserId: meta.atUserId,
+            raw: cfg.reply.mode === 'raw',
+          }),
+          signal: AbortSignal.timeout(Math.max(1000, Number(cfg.hook.timeoutMs) || 8000)),
+        })
+        const detail = await response.text().catch(() => '')
+        let payload
+        try { payload = JSON.parse(detail) } catch { payload = undefined }
+        const ok = response.ok && (payload === undefined || payload.ok !== false)
+        if (!ok) log('warn', `hook send rejected: ${detail.slice(0, 300)}`)
+        return { ok, detail: ok ? 'sent' : detail.slice(0, 300) || `HTTP ${response.status}` }
+      }
       // generic：交给外部网关
       if (!cfg.gateway.sendUrl) return { ok: false, detail: 'gateway.sendUrl is not configured' }
       const headers = { 'content-type': 'application/json' }
@@ -725,6 +780,180 @@ export function apply(ctx, config) {
     return true
   }
 
+  //  个人微信 hook：主动轮询 + 主动发送
+  // ────────────────────────────────────────────────────────────────────────
+  // 个人微信没有公开 API，只能靠一个本机 hook 服务（WeChatFerry / Gewechat / 自建）。
+  // 约定：hook 服务提供 GET <messagesPath>?cursor=&limit= 与 POST <sendPath>。
+  // 参考实现见 gateway/hook-gateway.mjs（含 mock 驱动，不需要微信也能联调）。
+  const hookRuntime = {
+    running: false,
+    paused: false,
+    timer: null,
+    cursor: String(cfg.hook.cursor ?? ''),
+    seen: new Set(),
+    seenOrder: [],
+    lastPollAt: 0,
+    lastOkAt: 0,
+    failures: 0,
+    lastError: '',
+    pulled: 0,
+    startedAt: 0,
+  }
+
+  const hookReady = () => cfg.kind === 'hook' && Boolean(String(cfg.hook.baseUrl ?? '').trim())
+
+  const rememberHookMessage = (id) => {
+    if (!id) return false
+    if (hookRuntime.seen.has(id)) return true
+    hookRuntime.seen.add(id)
+    hookRuntime.seenOrder.push(id)
+    if (hookRuntime.seenOrder.length > 1000) {
+      const dropped = hookRuntime.seenOrder.splice(0, hookRuntime.seenOrder.length - 1000)
+      for (const old of dropped) hookRuntime.seen.delete(old)
+    }
+    return false
+  }
+
+  const hookStatus = () => ({
+    kind: cfg.kind,
+    configured: hookReady(),
+    baseUrl: cfg.hook.baseUrl ?? '',
+    secretSet: Boolean(cfg.hook.secret),
+    running: hookRuntime.running,
+    paused: hookRuntime.paused,
+    cursor: hookRuntime.cursor,
+    pollMs: Number(cfg.hook.pollMs) || 3000,
+    lastPollAt: hookRuntime.lastPollAt,
+    lastOkAt: hookRuntime.lastOkAt,
+    failures: hookRuntime.failures,
+    lastError: hookRuntime.lastError,
+    pulled: hookRuntime.pulled,
+    seen: hookRuntime.seen.size,
+    startedAt: hookRuntime.startedAt,
+  })
+
+  /** 拉一次。成功返回 { ok, cursor, accepted, skipped, total }。 */
+  const pollHookOnce = async () => {
+    if (!hookReady()) return { ok: false, detail: 'kind!=hook 或 hook.baseUrl 未配置' }
+    const base = String(cfg.hook.baseUrl).replace(/\/+$/, '')
+    const query = new URLSearchParams()
+    if (hookRuntime.cursor) query.set('cursor', hookRuntime.cursor)
+    query.set('limit', String(Math.max(1, Math.min(200, Number(cfg.hook.limit) || 50))))
+    const headers = {}
+    if (cfg.hook.secret) headers['x-wechat-secret'] = cfg.hook.secret
+    hookRuntime.lastPollAt = Date.now()
+
+    let payload
+    try {
+      const response = await fetch(`${base}${cfg.hook.messagesPath || '/messages'}?${query.toString()}`, {
+        headers,
+        signal: AbortSignal.timeout(Math.max(1000, Number(cfg.hook.timeoutMs) || 8000)),
+      })
+      const text = await response.text()
+      if (!response.ok) throw new Error(`HTTP ${response.status} ${text.slice(0, 200)}`)
+      payload = text.trim() ? JSON.parse(text) : {}
+    } catch (error) {
+      hookRuntime.failures += 1
+      hookRuntime.lastError = String(error?.message ?? error).slice(0, 300)
+      state.counters.errors += 1
+      log('warn', `hook poll failed (${hookRuntime.failures}): ${hookRuntime.lastError}`)
+      const maxFailures = Number(cfg.hook.maxFailures) || 0
+      if (maxFailures > 0 && hookRuntime.failures >= maxFailures) {
+        hookRuntime.paused = true
+        log('warn', `hook 轮询连续失败 ${hookRuntime.failures} 次，已暂停（到面板里点“继续/poll”或重启插件）`)
+      }
+      return { ok: false, detail: hookRuntime.lastError, failures: hookRuntime.failures }
+    }
+
+    hookRuntime.failures = 0
+    hookRuntime.paused = false
+    hookRuntime.lastOkAt = Date.now()
+    hookRuntime.lastError = ''
+    const list = Array.isArray(payload) ? payload : (Array.isArray(payload?.messages) ? payload.messages : [])
+    const nextCursor = payload?.cursor ?? payload?.nextCursor
+    const selfIds = new Set((cfg.hook.selfIds ?? []).map((item) => String(item)))
+    let accepted = 0
+    let skipped = 0
+    for (const raw of list) {
+      const id = raw?.id ?? raw?.messageId
+      if (id !== undefined && rememberHookMessage(String(id))) { skipped += 1; continue }
+      const senderId = String(raw?.senderId ?? raw?.sender ?? raw?.from ?? '')
+      if (selfIds.size > 0 && selfIds.has(senderId)) { skipped += 1; continue }
+      const ok = dispatchInbound({
+        chatId: raw?.chatId ?? raw?.from ?? raw?.roomId ?? raw?.wxid,
+        chatName: raw?.chatName ?? raw?.name ?? raw?.roomName,
+        kind: raw?.kind ?? (raw?.roomId ? 'group' : 'private'),
+        senderId,
+        senderName: raw?.senderName ?? raw?.name,
+        text: raw?.text ?? raw?.content,
+        messageId: id,
+        members: raw?.members,
+        time: Number.isSafeInteger(raw?.time) ? raw.time : undefined,
+      })
+      if (ok) accepted += 1
+      else skipped += 1
+    }
+    if (nextCursor !== undefined && nextCursor !== null) {
+      hookRuntime.cursor = String(nextCursor)
+      cfg.hook.cursor = hookRuntime.cursor
+    }
+    hookRuntime.pulled += accepted
+    persist()
+    debug(`hook poll: +${accepted} accepted / ${skipped} skipped, cursor=${hookRuntime.cursor}`)
+    return { ok: true, cursor: hookRuntime.cursor, accepted, skipped, total: list.length }
+  }
+
+  const scheduleHook = (delay) => {
+    if (hookRuntime.timer) { clearTimeout(hookRuntime.timer); hookRuntime.timer = null }
+    if (!hookRuntime.running) return
+    const wait = Math.max(300, Number(delay ?? cfg.hook.pollMs) || 3000)
+    hookRuntime.timer = setTimeout(() => {
+      hookRuntime.timer = null
+      void (async () => {
+        const result = await pollHookOnce()
+        if (!hookRuntime.running) return
+        if (result.ok) {
+          scheduleHook(cfg.hook.pollMs)
+        } else if (!hookRuntime.paused) {
+          const backoff = Math.min(60000, (Number(cfg.hook.pollMs) || 3000) * 2 ** Math.min(hookRuntime.failures, 4))
+          scheduleHook(backoff)
+        }
+      })()
+    }, wait)
+    if (typeof hookRuntime.timer.unref === 'function') hookRuntime.timer.unref()
+  }
+
+  const startHook = () => {
+    if (!hookReady()) return { ok: false, detail: 'kind!=hook 或 hook.baseUrl 未配置' }
+    if (hookRuntime.running) return { ok: true, running: true, detail: '已在轮询' }
+    hookRuntime.running = true
+    hookRuntime.paused = false
+    hookRuntime.failures = 0
+    hookRuntime.startedAt = Date.now()
+    scheduleHook(0)
+    log('info', `hook 轮询已启动 → ${cfg.hook.baseUrl}`)
+    return { ok: true, running: true, cursor: hookRuntime.cursor }
+  }
+
+  const stopHook = () => {
+    hookRuntime.running = false
+    if (hookRuntime.timer) { clearTimeout(hookRuntime.timer); hookRuntime.timer = null }
+    return { ok: true, running: false }
+  }
+
+  const resetHookCursor = (cursor) => {
+    hookRuntime.cursor = String(cursor ?? '')
+    cfg.hook.cursor = hookRuntime.cursor
+    hookRuntime.failures = 0
+    hookRuntime.paused = false
+    return { ok: true, cursor: hookRuntime.cursor }
+  }
+
+  ctx.effect(() => {
+    if (cfg.kind === 'hook' && cfg.hook.autoStart && cfg.hook.baseUrl) startHook()
+    return () => { stopHook() }
+  }, 'wechat-bridge.hookPoller()')
+
   // ── HTTP 路由 ───────────────────────────────────────────────────────────
   const path = cfg.webhookPath.startsWith('/') ? cfg.webhookPath : `/${cfg.webhookPath}`
   /** 面板管理接口前缀：默认 /wechat/webhook → /wechat/api/*。 */
@@ -765,6 +994,15 @@ export function apply(ctx, config) {
         idleSessionMs: cfg.reply.idleSessionMs,
         maxMessages: cfg.history.maxMessages,
         debug: cfg.debug,
+        // hook 配置同样只回「是否已设置」
+        hook: {
+          baseUrl: cfg.hook.baseUrl ?? '',
+          secretSet: Boolean(cfg.hook.secret),
+          pollMs: Number(cfg.hook.pollMs) || 3000,
+          limit: Number(cfg.hook.limit) || 50,
+          selfIds: cfg.hook.selfIds ?? [],
+          autoStart: cfg.hook.autoStart !== false,
+        },
         // 凭据只回「是否已设置」，绝不把明文送进浏览器
         gateway: {
           sendUrl: cfg.gateway.sendUrl,
@@ -776,6 +1014,7 @@ export function apply(ctx, config) {
         },
       },
       autoReply: !autoReplyOff,
+      hook: hookStatus(),
       agentServices: Boolean(agentApi),
       presets: presets.list,
       presetsError: presets.error,
@@ -916,6 +1155,13 @@ export function apply(ctx, config) {
         if (timer !== null) clearTimeout(timer)
       }
     },
+
+    /* ── 个人微信 hook ── */
+    hookStatus: () => hookStatus(),
+    hookStart: () => startHook(),
+    hookStop: () => stopHook(),
+    hookPoll: () => pollHookOnce(),
+    hookResetCursor: (cursor) => resetHookCursor(cursor),
 
     /** 清本地缓存（等同 /wechat reset），不动真实微信会话与 DSH session。 */
     reset: () => {
@@ -1061,6 +1307,11 @@ export function apply(ctx, config) {
           setAutoReply: (value) => {
             autoReplyOff = !value
             cfg.reply.autoReply = value
+          },
+          /** 面板改完 hook 配置后让轮询器按新配置重来。 */
+          restartHook: () => {
+            stopHook()
+            if (cfg.kind === 'hook' && cfg.hook.autoStart !== false && cfg.hook.baseUrl) startHook()
           },
         },
         snapshot,
@@ -1611,6 +1862,84 @@ export function apply(ctx, config) {
   })
 
   register({
+    name: 'wechat_hook',
+    description: '个人微信 hook 的运行控制：status=看状态，start/stop=开关主动轮询，poll=立刻拉一次，reset-cursor=把游标归零（下次从最新开始）。只在 kind=hook 时有意义。',
+    parameters: {
+      action: { type: 'string', required: true, enum: ['status', 'start', 'stop', 'poll', 'reset-cursor'], description: '要做的动作。' },
+      cursor: { type: 'string', description: 'reset-cursor 时可指定新游标；省略=从最新开始。' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true },
+          action: { type: 'string', required: true },
+          kind: { type: 'string', required: true },
+          running: { type: 'boolean', required: true },
+          paused: { type: 'boolean', required: true },
+          cursor: { type: 'string' },
+          accepted: { type: 'integer' },
+          skipped: { type: 'integer' },
+          failures: { type: 'integer' },
+          lastError: { type: 'string' },
+          detail: { type: 'string' },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: value.ok
+          ? [
+            `hook ${value.kind}｜轮询 ${value.running ? '运行中' : '已停止'}${value.paused ? '（已暂停）' : ''}`,
+            value.cursor ? `游标 ${value.cursor}` : '',
+            value.accepted === undefined ? '' : `本次 +${value.accepted} 条 / 跳过 ${value.skipped}`,
+            value.lastError ? `最近错误：${value.lastError}` : '',
+          ].filter(Boolean).join('｜')
+          : `hook 动作 ${value.action} 失败：${value.detail ?? value.lastError ?? 'unknown'}`,
+      }],
+    },
+    execute: async (args) => {
+      const action = String(args?.action ?? 'status')
+      const base = { action, kind: cfg.kind, running: hookRuntime.running, paused: hookRuntime.paused }
+      if (action === 'status') {
+        const status = hookStatus()
+        return {
+          ok: true,
+          ...base,
+          running: status.running,
+          paused: status.paused,
+          cursor: status.cursor,
+          failures: status.failures,
+          ...(status.lastError ? { lastError: status.lastError } : {}),
+          ...(status.configured ? {} : { detail: 'kind!=hook 或 hook.baseUrl 未配置' }),
+        }
+      }
+      if (action === 'start') {
+        const outcome = startHook()
+        return { ok: outcome.ok !== false, ...base, running: hookRuntime.running, ...(outcome.cursor ? { cursor: outcome.cursor } : {}), ...(outcome.detail ? { detail: outcome.detail } : {}) }
+      }
+      if (action === 'stop') {
+        stopHook()
+        return { ok: true, ...base, running: false }
+      }
+      if (action === 'reset-cursor') {
+        const outcome = resetHookCursor(args?.cursor)
+        return { ok: true, ...base, cursor: outcome.cursor }
+      }
+      const outcome = await pollHookOnce()
+      return {
+        ok: outcome.ok !== false,
+        ...base,
+        ...(outcome.cursor ? { cursor: outcome.cursor } : {}),
+        ...(Number.isInteger(outcome.accepted) ? { accepted: outcome.accepted } : {}),
+        ...(Number.isInteger(outcome.skipped) ? { skipped: outcome.skipped } : {}),
+        ...(Number.isInteger(outcome.failures) ? { failures: outcome.failures } : {}),
+        ...(outcome.detail ? { detail: outcome.detail } : {}),
+      }
+    },
+  })
+
+  register({
     name: 'wechat_get_prompt',
     description: '查看当前微信桥接的人格提示词、网关配置摘要、可用工具与已知会话，用于进入角色或刷新状态。',
     parameters: {},
@@ -1638,7 +1967,7 @@ export function apply(ctx, config) {
       kind: cfg.kind,
       autoReply: !autoReplyOff,
       chats: state.chats.size,
-      tools: ['wechat_status', 'wechat_diagnose', 'wechat_list_chats', 'wechat_get_unread_messages', 'wechat_get_recent_messages', 'wechat_send_message', 'wechat_get_members', 'wechat_mark_read', 'wechat_memory_append', 'wechat_memory_query', 'wechat_memory_remove', 'wechat_get_prompt'],
+      tools: ['wechat_status', 'wechat_hook', 'wechat_diagnose', 'wechat_list_chats', 'wechat_get_unread_messages', 'wechat_get_recent_messages', 'wechat_send_message', 'wechat_get_members', 'wechat_mark_read', 'wechat_memory_append', 'wechat_memory_query', 'wechat_memory_remove', 'wechat_get_prompt'],
     }),
   })
 

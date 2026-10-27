@@ -1,7 +1,7 @@
 {
   "name": "dsh-wechat-bridge",
-  "version": "0.2.0",
-  "description": "微信接入桥接插件：Webhook/Official Account 网关 + wechat_* 工具 + 每会话自动回复 agent，并附带一个一键启动的统一管理面板",
+  "version": "0.3.0",
+  "description": "微信接入桥接插件：Webhook / 公众号 / 企微群机器人 / 个人微信 hook（主动轮询）+ wechat_* 工具 + 每会话自动回复 agent + 一键管理面板",
   "type": "module",
   "private": true,
   "license": "MIT",
@@ -20,6 +20,8 @@
     "cordis.patch.yml",
     "presets/*.patch.yml",
     "persona/*.md",
+    "gateway/*.mjs",
+    "gateway/README.md",
     "scripts/*.mjs",
     "locale/*.json",
     "icon.svg",
@@ -27,7 +29,8 @@
   ],
   "scripts": {
     "build:preset": "node scripts/build-preset.mjs",
-    "selftest": "node scripts/selftest.mjs"
+    "selftest": "node scripts/selftest.mjs",
+    "test:hook": "node scripts/test-hook-gateway.mjs && node scripts/test-hook-integration.mjs"
   },
   "dsh": {
     "bundle": {

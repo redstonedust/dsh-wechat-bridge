@@ -22,6 +22,7 @@ import { readOverride } from '../lib/panel.js'
 
 // 自检用独立状态文件，绝不碰真实 ~/.dsh/wechat-bridge/state.json
 const STATE_FILE = join(tmpdir(), `wechat-bridge-selftest-${process.pid}.json`)
+const HOOK_STATE_FILE = join(tmpdir(), `wechat-bridge-selftest-hook-${process.pid}.json`)
 rmSync(STATE_FILE, { force: true })
 
 // 面板覆盖值也写到临时文件（面板默认会写 ~/.dsh/wechat-bridge/config.override.json）
@@ -145,8 +146,21 @@ const services = {
 }
 
 // fetch 打桩
+// hook 网关的假实现：测试往 hookInbox 里塞消息，插件轮询时一次性取走
+let hookInbox = []
+let hookCursor = 0
 globalThis.fetch = async (url, init) => {
-  sent.push({ url: String(url), body: init?.body ? JSON.parse(init.body) : undefined })
+  const target = String(url)
+  sent.push({ url: target, body: init?.body ? JSON.parse(init.body) : undefined })
+  if (target.startsWith('http://hook.test/messages')) {
+    const batch = hookInbox
+    hookInbox = []
+    hookCursor += batch.length
+    return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, cursor: String(hookCursor), messages: batch }) }
+  }
+  if (target === 'http://hook.test/send') {
+    return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id: 'out-1' }) }
+  }
   return { ok: true, status: 200, text: async () => 'ok', json: async () => ({ errcode: 0 }) }
 }
 
@@ -160,7 +174,7 @@ await check('apply() 不抛异常', () => apply(ctx, {
   overrideFile: OVERRIDE_FILE,
   debug: false,
 }))
-await check('注册了 12 个工具', () => assert.equal(registrations.tools.length, 12))
+await check('注册了 13 个工具', () => assert.equal(registrations.tools.length, 13))
 await check('注册了 webhook 路由', () => assert.ok(webRoutes.has('/wechat/webhook')))
 await check('注册了状态路由', () => assert.ok(webRoutes.has('/wechat/webhook/status')))
 await check('注入了人格 md（全局 scope=all，且关闭模板插值）', () => {
@@ -301,7 +315,7 @@ await (async () => {
   const prompt = await call('wechat_get_prompt')
   await check('get_prompt 带人格与工具清单', () => {
     assert.ok(prompt.persona.length > 200)
-    assert.equal(prompt.tools.length, 12)
+    assert.equal(prompt.tools.length, 13)
   })
 })()
 
@@ -593,6 +607,98 @@ await (async () => {
       assert.ok(['info', 'warn', 'error'].includes(event.level), `bad event level: ${event.level}`)
     }
   }))
+})()
+
+console.log('\n[8] 个人微信 hook 链路（kind=hook）')
+await (async () => {
+  const hookCtx = makeCtx(services)
+  const before = registrations.tools.length
+  apply(hookCtx, {
+    kind: 'hook',
+    hook: {
+      baseUrl: 'http://hook.test',
+      secret: 'hsekret',
+      pollMs: 50,
+      autoStart: false,
+      selfIds: ['wxid_self'],
+    },
+    reply: { autoReply: true, mode: 'raw', agentPreset: 'wechat-agent' },
+    stateFile: HOOK_STATE_FILE,
+    debug: false,
+  })
+  const hookTools = registrations.tools.slice(before)
+  const find = (toolName) => hookTools.find((tool) => tool.name === toolName)
+  const run = async (toolName, args = {}) => {
+    const tool = find(toolName)
+    assert.ok(tool, `hook 实例缺少工具 ${toolName}`)
+    const value = await tool.execute(args, { agent: undefined, signal: new AbortController().signal })
+    const violations = tools.validateJsonSchemaValue(tool.output.schema, value)
+    assert.deepEqual(violations, [], `${toolName} 输出不合 schema`)
+    return value
+  }
+
+  check('hook 实例也注册了完整工具面（含 wechat_hook）', () => {
+    assert.equal(hookTools.length, registrations.tools.length - before)
+    assert.ok(find('wechat_hook'), 'wechat_hook 缺失')
+  })
+
+  check('wechat_hook status 报告未轮询', async () => {
+    const status = await run('wechat_hook', { action: 'status' })
+    assert.equal(status.kind, 'hook')
+    assert.equal(status.running, false)
+    assert.equal(status.ok, true)
+  })
+
+  hookInbox = [
+    { id: 'h1', chatId: 'wxid_hook', chatName: 'Hook 好友', kind: 'private', senderId: 'wxid_hook', senderName: 'Hook 好友', text: '第一条' },
+    { id: 'h2', chatId: 'room_hook', chatName: 'Hook 群', kind: 'group', senderId: 'wxid_member', senderName: '群友', text: '第二条' },
+    { id: 'h3', chatId: 'wxid_hook', chatName: 'Hook 好友', kind: 'private', senderId: 'wxid_self', senderName: '我自己', text: '我自己发的，应被丢弃' },
+  ]
+  const pulled = await run('wechat_hook', { action: 'poll' })
+  check('poll 拉取并入库（丢弃 selfIds 来源）', () => {
+    assert.equal(pulled.ok, true)
+    assert.equal(pulled.accepted, 2)
+    assert.equal(pulled.skipped, 1)
+    assert.equal(pulled.cursor, '3')
+  })
+
+  const chats = await run('wechat_list_chats', {})
+  check('两个会话都建档', () => {
+    const ids = chats.chats.map((chat) => chat.chatId).sort()
+    assert.deepEqual(ids, ['room_hook', 'wxid_hook'])
+    assert.equal(chats.chats.find((c) => c.chatId === 'room_hook').kind, 'group')
+  })
+
+  const recent = await run('wechat_get_recent_messages', { chatId: 'wxid_hook', limit: 10 })
+  check('消息内容按原样入库', () => {
+    assert.equal(recent.messages.at(-1).text, '第一条')
+  })
+
+  // 同一批消息再来一次：靠 messageId 去重
+  hookInbox = [
+    { id: 'h1', chatId: 'wxid_hook', chatName: 'Hook 好友', text: '第一条（重复投递）' },
+  ]
+  const again = await run('wechat_hook', { action: 'poll' })
+  check('重复 messageId 被去重', () => {
+    assert.equal(again.accepted, 0)
+    assert.equal(again.skipped, 1)
+  })
+
+  const outbound = await run('wechat_send_message', { chatId: 'wxid_hook', message: 'hook 回了一条' })
+  check('kind=hook 时出站打到 <baseUrl>/send', () => {
+    assert.equal(outbound.ok, true)
+    const posted = sent.filter((item) => item.url === 'http://hook.test/send')
+    assert.equal(posted.length, 1)
+    assert.equal(posted[0].body.chatId, 'wxid_hook')
+    assert.equal(posted[0].body.text, 'hook 回了一条')
+  })
+
+  const started = await run('wechat_hook', { action: 'start' })
+  check('start 之后 running=true', () => assert.equal(started.running, true))
+  const stopped = await run('wechat_hook', { action: 'stop' })
+  check('stop 之后 running=false', () => assert.equal(stopped.running, false))
+  const reset = await run('wechat_hook', { action: 'reset-cursor', cursor: '' })
+  check('reset-cursor 清空游标', () => assert.equal(reset.cursor, ''))
 })()
 
 rmSync(OVERRIDE_FILE, { force: true })

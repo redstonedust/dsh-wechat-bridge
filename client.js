@@ -221,6 +221,31 @@ window.__ModuleLoader__.load({
       'field.kind': '网关类型',
       'field.kind.generic': '自建网关（通用 HTTP）',
       'field.kind.official': '微信公众号',
+      'field.kind.hook': '个人微信 Hook',
+      'field.hookBaseUrl': 'Hook 服务地址',
+      'field.hookBaseUrlHint': '插件会主动轮询这个地址。默认 gateway/hook-gateway.mjs 是 http://127.0.0.1:8788。',
+      'field.hookSecret': 'Hook 密钥',
+      'field.hookSecretHint': '与 hook 服务约定的共享密钥（请求头 X-WeChat-Secret），留空不校验。',
+      'field.hookPollMs': '轮询间隔（毫秒）',
+      'field.hookPollMsHint': '多久拉一次新消息，默认 3000。太频繁会白耗 CPU。',
+      'field.hookSelfIds': '机器人自己的 id',
+      'field.hookSelfIdsHint': '逗号分隔。来自这些 id 的消息会被丢弃，防止自己回自己。',
+      'console.hook.title': '个人微信 Hook',
+      'console.hook.desc': '插件主动轮询本地 hook 服务（WeChatFerry / Gewechat / gateway/hook-gateway.mjs），把消息喂给 agent。',
+      'console.hook.on': '轮询中',
+      'console.hook.off': '未轮询',
+      'console.hook.unconfigured': '还没配 hook.baseUrl，或当前网关类型不是 hook。到「设置 → 网关」里改。',
+      'console.hook.cursor': '游标',
+      'console.hook.cursorNone': '（从最新开始）',
+      'console.hook.pulled': '已收消息',
+      'console.hook.baseUrl': 'Hook 地址',
+      'console.hook.lastError': '最近错误',
+      'console.hook.start': '开始轮询',
+      'console.hook.stop': '停止轮询',
+      'console.hook.poll': '立即拉一次',
+      'console.hook.reset': '游标归零',
+      'console.hook.done': '已执行',
+      'console.hook.polled': '拉到 {added} 条，跳过 {skipped} 条',
       'field.kind.wecom': '企业微信群机器人',
       'field.kindHint': '选哪种取决于你手上是什么。自建网关最常见。',
       'field.sendUrl': '出站地址',
@@ -451,6 +476,31 @@ window.__ModuleLoader__.load({
       'field.kind': 'Gateway type',
       'field.kind.generic': 'Self-hosted gateway (plain HTTP)',
       'field.kind.official': 'WeChat Official Account',
+      'field.kind.hook': 'Personal WeChat hook',
+      'field.hookBaseUrl': 'Hook service URL',
+      'field.hookBaseUrlHint': 'The plugin polls this address. gateway/hook-gateway.mjs serves http://127.0.0.1:8788 by default.',
+      'field.hookSecret': 'Hook secret',
+      'field.hookSecretHint': 'Shared secret with the hook service (X-WeChat-Secret header). Empty means no check.',
+      'field.hookPollMs': 'Poll interval (ms)',
+      'field.hookPollMsHint': 'How often to pull new messages. 3000 by default; too small just burns CPU.',
+      'field.hookSelfIds': 'Bot ids',
+      'field.hookSelfIdsHint': 'Comma separated. Messages from these ids are dropped so the bot never answers itself.',
+      'console.hook.title': 'Personal WeChat hook',
+      'console.hook.desc': 'The plugin polls a local hook service (WeChatFerry / Gewechat / gateway/hook-gateway.mjs) and feeds messages to the agent.',
+      'console.hook.on': 'Polling',
+      'console.hook.off': 'Idle',
+      'console.hook.unconfigured': 'hook.baseUrl is not set, or the gateway kind is not hook. Change it under Settings → Gateway.',
+      'console.hook.cursor': 'Cursor',
+      'console.hook.cursorNone': '(start from newest)',
+      'console.hook.pulled': 'Received',
+      'console.hook.baseUrl': 'Hook URL',
+      'console.hook.lastError': 'Last error',
+      'console.hook.start': 'Start polling',
+      'console.hook.stop': 'Stop polling',
+      'console.hook.poll': 'Pull once now',
+      'console.hook.reset': 'Reset cursor',
+      'console.hook.done': 'Done',
+      'console.hook.polled': 'Pulled {added}, skipped {skipped}',
       'field.kind.wecom': 'WeCom group bot',
       'field.kindHint': 'Pick whichever you actually have. Self-hosted is the common case.',
       'field.sendUrl': 'Outbound URL',
@@ -1764,6 +1814,7 @@ window.__ModuleLoader__.load({
       const stub = isRecord(snap.stub) ? snap.stub : {};
       const config = isRecord(snap.config) ? snap.config : {};
       const gateway = isRecord(config.gateway) ? config.gateway : {};
+      const hook = isRecord(snap.hook) ? snap.hook : {};
 
       const [chatId, setChatId] = React.useState('wechat-test');
       const [text, setText] = React.useState('面板里造的一条测试消息');
@@ -1783,6 +1834,9 @@ window.__ModuleLoader__.load({
       const [stubErr, setStubErr] = React.useState('');
       const [resetBusy, setResetBusy] = React.useState(false);
       const [resetNote, setResetNote] = React.useState('');
+      const [hookBusy, setHookBusy] = React.useState(false);
+      const [hookNote, setHookNote] = React.useState('');
+      const [hookErr, setHookErr] = React.useState('');
 
       /* 出站会话默认跟着第一个会话走。 */
       React.useEffect(function defaultOutChat() {
@@ -1817,6 +1871,24 @@ window.__ModuleLoader__.load({
             props.onRefresh();
           } else {
             setOutErr(describeFailure(result) + (result.detail ? ' · ' + asText(result.detail) : ''));
+          }
+        });
+      };
+
+      const onHook = function onHook(action) {
+        setHookBusy(true);
+        setHookNote('');
+        setHookErr('');
+        postJson(ROUTES.console, { action: action }).then(function done(result) {
+          setHookBusy(false);
+          if (result.ok) {
+            setHookNote(action === 'hook-poll'
+              ? T('console.hook.polled', { added: String(Number(result.accepted) || 0), skipped: String(Number(result.skipped) || 0) })
+              : T('console.hook.done'));
+            props.onRefresh();
+          } else {
+            const detail = asText(result.detail) || asText(result.message);
+            setHookErr(describeFailure(result) + (detail ? ' · ' + detail : ''));
           }
         });
       };
@@ -1962,7 +2034,43 @@ window.__ModuleLoader__.load({
             h(CardHead, { title: T('console.reset.title'), sub: T('console.reset.desc') }),
             h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } },
               h(Btn, { variant: 'danger', icon: 'alert', disabled: resetBusy, onClick: onReset }, T('console.reset.action')),
-              resetNote ? h('span', { className: 'wx-muted', style: { fontSize: '11.5px' } }, resetNote) : null))));
+              resetNote ? h('span', { className: 'wx-muted', style: { fontSize: '11.5px' } }, resetNote) : null))),
+
+        h(Card, { delay: 200 },
+          h(CardHead, {
+            title: T('console.hook.title'),
+            sub: T('console.hook.desc'),
+            side: h(Pill, { tone: hook.running ? 'on' : undefined },
+              hook.running ? T('console.hook.on') : T('console.hook.off')),
+          }),
+          hook.configured === false
+            ? h('div', { className: 'wx-field-hint' }, T('console.hook.unconfigured'))
+            : null,
+          h('div', { className: 'wx-rows' },
+            h('div', { className: 'wx-row' },
+              h('span', { className: 'wx-row-main' }, T('console.hook.cursor')),
+              h('span', { className: 'wx-muted wx-mono' }, asText(hook.cursor) || T('console.hook.cursorNone'))),
+            h('div', { className: 'wx-row' },
+              h('span', { className: 'wx-row-main' }, T('console.hook.pulled')),
+              h('span', { className: 'wx-muted wx-mono' }, String(Number(hook.pulled) || 0))),
+            asText(hook.baseUrl)
+              ? h('div', { className: 'wx-row' },
+                  h('span', { className: 'wx-row-main' }, T('console.hook.baseUrl')),
+                  h('span', { className: 'wx-muted wx-mono' }, asText(hook.baseUrl)))
+              : null,
+            asText(hook.lastError)
+              ? h('div', { className: 'wx-row' },
+                  h('span', { className: 'wx-row-main' }, T('console.hook.lastError')),
+                  h('span', { className: 'wx-muted' }, truncate(asText(hook.lastError), 120)))
+              : null),
+          h('div', { style: { display: 'flex', gap: '8px', marginTop: '12px', flexWrap: 'wrap' } },
+            hook.running
+              ? h(Btn, { icon: 'stop', disabled: hookBusy, onClick: function stop() { onHook('hook-stop'); } }, T('console.hook.stop'))
+              : h(Btn, { variant: 'primary', icon: 'play', disabled: hookBusy, onClick: function start() { onHook('hook-start'); } }, T('console.hook.start')),
+            h(Btn, { icon: 'refresh', disabled: hookBusy, onClick: function poll() { onHook('hook-poll'); } }, T('console.hook.poll')),
+            h(Btn, { icon: 'alert', disabled: hookBusy, onClick: function reset() { onHook('hook-reset-cursor'); } }, T('console.hook.reset'))),
+          hookNote ? h('div', { className: 'wx-ok-line' }, hookNote) : null,
+          hookErr ? h('div', { className: 'wx-error-line' }, hookErr) : null));
     }
 
     /* ═════════════════════════════ 设置 ═════════════════════════════ */
@@ -1994,13 +2102,21 @@ window.__ModuleLoader__.load({
         wecomWebhook: '',
         debug: Boolean(config.debug),
       };
-      return { reply: reply, gateway: tap };
+      const hook = {
+        baseUrl: asText(isRecord(config.hook) ? config.hook.baseUrl : ''),
+        secret: '',
+        pollMs: String(Number(isRecord(config.hook) ? config.hook.pollMs : 0) || 3000),
+        limit: String(Number(isRecord(config.hook) ? config.hook.limit : 0) || 50),
+        selfIds: joinList(isRecord(config.hook) ? config.hook.selfIds : []),
+      };
+      return { reply: reply, gateway: tap, hook: hook };
     }
 
     function SettingsTab(props) {
       const snap = props.snapshot;
       const config = isRecord(snap.config) ? snap.config : {};
       const gatewayConfig = isRecord(config.gateway) ? config.gateway : {};
+      const hookConfig = isRecord(config.hook) ? config.hook : {};
       const presets = asList(snap.presets);
       const override = isRecord(snap.override) ? snap.override : {};
       const overrideCount = Object.keys(override).length;
@@ -2067,6 +2183,21 @@ window.__ModuleLoader__.load({
             else patch['reply.' + key] = asText(value);
             continue;
           }
+          if (group === 'hook') {
+            if (key === 'secret') {
+              if (asText(value).trim() === '') continue;
+              patch['hook.secret'] = asText(value);
+            } else if (key === 'pollMs') {
+              patch['hook.pollMs'] = Math.max(500, Number(value) || 3000);
+            } else if (key === 'limit') {
+              patch['hook.limit'] = Math.max(1, Math.min(200, Number(value) || 50));
+            } else if (key === 'selfIds') {
+              patch['hook.selfIds'] = splitList(value);
+            } else {
+              patch['hook.' + key] = asText(value);
+            }
+            continue;
+          }
           if (key === 'debug') {
             patch.debug = Boolean(value);
             continue;
@@ -2097,6 +2228,7 @@ window.__ModuleLoader__.load({
             const next = seedDraft(snap);
             next.reply = Object.assign({}, previous.reply);
             next.gateway = Object.assign({}, previous.gateway, { sharedSecret: '', appSecret: '', token: '' });
+            next.hook = Object.assign({}, previous.hook, { secret: '' });
             return next;
           });
           if (typeof props.onSaved === 'function') props.onSaved();
@@ -2134,6 +2266,7 @@ window.__ModuleLoader__.load({
         { id: 'generic', label: T('field.kind.generic') },
         { id: 'official', label: T('field.kind.official') },
         { id: 'wecom', label: T('field.kind.wecom') },
+        { id: 'hook', label: T('field.kind.hook') },
       ];
 
       return h('div', { style: { display: 'flex', flexDirection: 'column', gap: '18px' } },
@@ -2258,6 +2391,40 @@ window.__ModuleLoader__.load({
                 placeholder: gatewayConfig.sharedSecretSet ? T('field.secretPlaceholder') : T('field.secretEmpty'),
                 onChange: function change(event) { setField('gateway', 'sharedSecret', event.target.value); },
               })),
+
+            draft.gateway.kind === 'hook'
+              ? h('div', null,
+                  h(Field, { label: T('field.hookBaseUrl'), hint: T('field.hookBaseUrlHint') },
+                    h('input', {
+                      className: 'wx-input wx-mono',
+                      value: draft.hook.baseUrl,
+                      placeholder: 'http://127.0.0.1:8788',
+                      onChange: function change(event) { setField('hook', 'baseUrl', event.target.value); },
+                    })),
+                  h(Field, { label: T('field.hookSecret'), hint: T('field.hookSecretHint') },
+                    h('input', {
+                      className: 'wx-input wx-mono',
+                      type: 'password',
+                      autoComplete: 'off',
+                      value: draft.hook.secret,
+                      placeholder: hookConfig.secretSet ? T('field.secretPlaceholder') : T('field.secretEmpty'),
+                      onChange: function change(event) { setField('hook', 'secret', event.target.value); },
+                    })),
+                  h(Field, { label: T('field.hookPollMs'), hint: T('field.hookPollMsHint') },
+                    h('input', {
+                      className: 'wx-input wx-mono',
+                      value: draft.hook.pollMs,
+                      inputMode: 'numeric',
+                      onChange: function change(event) { setField('hook', 'pollMs', event.target.value.replace(/[^0-9]/g, '')); },
+                    })),
+                  h(Field, { label: T('field.hookSelfIds'), hint: T('field.hookSelfIdsHint') },
+                    h('input', {
+                      className: 'wx-input wx-mono',
+                      value: draft.hook.selfIds,
+                      placeholder: 'wxid_bot',
+                      onChange: function change(event) { setField('hook', 'selfIds', event.target.value); },
+                    })))
+              : null,
 
             draft.gateway.kind === 'official'
               ? h('div', null,

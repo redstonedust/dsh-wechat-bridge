@@ -10,7 +10,8 @@
       name: dsh-wechat-bridge
       config:
         enabled: true
-        # generic=任意自建网关（推荐先用它把链路跑通）；official=微信公众平台；wecom=企业微信群机器人
+        # generic=任意自建网关；official=微信公众平台；wecom=企业微信群机器人；
+        # hook=个人微信（插件主动轮询 gateway/hook-gateway.mjs 这类本机 hook 服务）
         kind: generic
         webhookPath: /wechat/webhook
         gateway:
@@ -24,6 +25,20 @@
           token: ''
           # wecom 群机器人 webhook
           wecomWebhook: ''
+        hook:
+          # kind=hook 时生效：插件从 baseUrl 拉 /messages，往 /send 发
+          baseUrl: ''
+          secret: ''
+          pollMs: 3000
+          limit: 50
+          cursor: ''
+          timeoutMs: 8000
+          messagesPath: /messages
+          sendPath: /send
+          # 机器人自己的 wxid，来自它的消息会被丢弃（防自问自答）
+          selfIds: []
+          autoStart: true
+          maxFailures: 5
         reply:
           autoReply: true
           # raw=模型最终文本原样发出（“原样输出”）；formatted=加前后缀
