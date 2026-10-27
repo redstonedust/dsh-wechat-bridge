@@ -699,6 +699,37 @@ await (async () => {
   check('stop 之后 running=false', () => assert.equal(stopped.running, false))
   const reset = await run('wechat_hook', { action: 'reset-cursor', cursor: '' })
   check('reset-cursor 清空游标', () => assert.equal(reset.cursor, ''))
+
+  // 连续失败后暂停，再 start 必须能恢复（否则面板「开始轮询」点了没反应）
+  const pauseCtx = makeCtx(services)
+  const beforePause = registrations.tools.length
+  apply(pauseCtx, {
+    kind: 'hook',
+    // 指向一个必然连不上的地址；autoStart 让它自己跑起来并在 2 次失败后暂停
+    hook: { baseUrl: 'http://127.0.0.1:1', secret: '', pollMs: 200, autoStart: true, maxFailures: 2, timeoutMs: 400 },
+    reply: { autoReply: false },
+    stateFile: join(tmpdir(), `wechat-pause-selftest-${process.pid}.json`),
+  })
+  const pauseTools = registrations.tools.slice(beforePause)
+  const pauseHook = pauseTools.find((tool) => tool.name === 'wechat_hook')
+  const callPause = (args) => pauseHook.execute(args, { agent: undefined, signal: new AbortController().signal })
+
+  let pausedStatus = await callPause({ action: 'status' })
+  for (let attempt = 0; attempt < 40 && pausedStatus.paused !== true; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    pausedStatus = await callPause({ action: 'status' })
+  }
+  check('连续失败后进入暂停（仍在运行状态里）', () => {
+    assert.equal(pausedStatus.paused, true)
+    assert.equal(pausedStatus.running, true)
+    assert.ok(pausedStatus.failures >= 2)
+  })
+  const resumed = await callPause({ action: 'start' })
+  check('暂停后 start 能恢复轮询', () => {
+    assert.equal(resumed.running, true)
+    assert.match(String(resumed.detail ?? ''), /恢复/)
+  })
+  await callPause({ action: 'stop' })
 })()
 
 console.log('\n[9] 注入微信（用假的注入器脚本验证编排）')

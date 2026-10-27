@@ -64,6 +64,7 @@ node gateway/hook-gateway.mjs --driver exec --port 8788 --secret change-me `
 cd native
 powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1      # 需要 MinGW gcc（PATH 里）
 powershell -NoProfile -ExecutionPolicy Bypass -File test-inject.ps1 # 自测：注入到自己起的靶子进程
+node ..\scripts\test-inject.mjs                                    # 自测：走插件那条编排路径
 ```
 
 然后在面板「设置 → 网关 → 个人微信 Hook」里填两样东西：**hook DLL 路径**（例如 WeChatFerry 的 `sdk.dll`）和**进程名**（默认 `WeChat.exe`），
@@ -319,7 +320,8 @@ node scripts\build-preset.mjs --check  # 校验没漂移
 - 公众号签名验签（GET echostr 原文返回、错误签名 403）+ XML 入站解析；
 - 个人微信 hook 全链路（真 HTTP、真网关）：`/mock/push` → 轮询拉取入库 → agent → `POST /send` → `/mock/out` 读回原文；含 401、去重、`selfIds` 过滤、游标增量；
 - 注入器自测（native/test-inject.ps1）：64 位注入成功、靶子进程里出现 marker 文件、进程不存在时返回 `process-not-found`；
-- 插件的注入编排（selftest）：注入器输出解析、缺注入器/缺 DLL 的可操作报错；
+- 插件的注入编排：`node scripts/test-inject.mjs` 拿**真实注入器**打进一个真实靶子进程，DLL 的 marker 文件出现、pid 回读、进程不存在时给 `process-not-found`；
+- selftest 里的注入分支：注入器输出解析、缺注入器 / 缺 DLL 的可操作报错；
 - hook 在**运行中的 DSH 里**跑通（v0.3.0）：`scenario-d` 一键脚本实测 agent 回复「在，说。」经网关 `/send` 收到；面板 `/api/console` 的 `hook-poll / hook-stop / hook-start / hook-reset-cursor` 与 `wechat_hook` 工具均按预期工作。
 
 **未验证**：真实微信侧网关（WeChatFerry / Gewechat / 公众号后台）。插件只约定协议，不含任何 hook 实现。

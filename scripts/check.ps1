@@ -49,6 +49,8 @@ try {
     if (Test-Path $injector) {
         powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'native\test-inject.ps1') | Select-Object -Last 3
         if ($LASTEXITCODE -ne 0) { Write-Fail 'native 注入自测未通过'; $failed++ } else { Write-Ok 'native 注入自测通过' }
+        node scripts/test-inject.mjs | Select-Object -Last 2
+        if ($LASTEXITCODE -ne 0) { Write-Fail '插件侧注入编排测试未通过'; $failed++ } else { Write-Ok '插件侧注入编排测试通过' }
     } else {
         Write-Warn '没有 native/build/wechat-inject.exe（先跑 native/build.ps1）；跳过'
     }

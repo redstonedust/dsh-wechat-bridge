@@ -1033,14 +1033,23 @@ export function apply(ctx, config) {
 
   const startHook = () => {
     if (!hookReady()) return { ok: false, detail: 'kind!=hook 或 hook.baseUrl 未配置' }
-    if (hookRuntime.running) return { ok: true, running: true, detail: '已在轮询' }
+    // 暂停（连续失败到 maxFailures）时 running 仍为 true，但计时器已经停了：
+    // 这里的 start 必须能把它救回来，否则面板上的「开始轮询」点了没反应。
+    const resuming = hookRuntime.running && hookRuntime.paused
+    if (hookRuntime.running && !resuming) return { ok: true, running: true, detail: '已在轮询' }
     hookRuntime.running = true
     hookRuntime.paused = false
     hookRuntime.failures = 0
-    hookRuntime.startedAt = Date.now()
+    hookRuntime.lastError = ''
+    if (!hookRuntime.startedAt) hookRuntime.startedAt = Date.now()
     scheduleHook(0)
-    log('info', `hook 轮询已启动 → ${cfg.hook.baseUrl}`)
-    return { ok: true, running: true, cursor: hookRuntime.cursor }
+    log('info', `${resuming ? '已恢复' : '已启动'} hook 轮询 → ${cfg.hook.baseUrl}`)
+    return {
+      ok: true,
+      running: true,
+      cursor: hookRuntime.cursor,
+      ...(resuming ? { resumed: true, detail: '已恢复轮询' } : { detail: '已启动轮询' }),
+    }
   }
 
   const stopHook = () => {
