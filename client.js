@@ -221,6 +221,15 @@ window.__ModuleLoader__.load({
       'field.kind': '网关类型',
       'field.kind.generic': '自建网关（通用 HTTP）',
       'field.kind.official': '微信公众号',
+      'field.kind.kf': '微信客服（官方 API）',
+      'field.kfCorpId': '企业 CorpID',
+      'field.kfCorpIdHint': '管理微信客服的那个企业微信 → 我的企业 → 企业 ID（ww 开头）。',
+      'field.kfSecret': '客服 Secret',
+      'field.kfOpenKfIdHint': '客服账号 id（wk 开头），来自「微信客服 → 客服账号」。',
+      'field.kfOpenKfId': '客服账号 ID',
+      'field.kfPollMs': '拉取间隔（毫秒）',
+      'console.hook.titleKf': '微信客服',
+      'console.hook.descKf': '官方 API：sync_msg 拉取 + send_msg 发送。不碰客户端、不依赖微信版本，但只能服务从客服入口进来的会话。',
       'field.kind.hook': '个人微信 Hook',
       'field.hookBaseUrl': 'Hook 服务地址',
       'field.hookBaseUrlHint': '插件会主动轮询这个地址。默认 gateway/hook-gateway.mjs 是 http://127.0.0.1:8788。',
@@ -488,6 +497,15 @@ window.__ModuleLoader__.load({
       'field.kind': 'Gateway type',
       'field.kind.generic': 'Self-hosted gateway (plain HTTP)',
       'field.kind.official': 'WeChat Official Account',
+      'field.kind.kf': 'WeChat Customer Service (official API)',
+      'field.kfCorpId': 'Corp ID',
+      'field.kfCorpIdHint': 'The WeCom tenant that owns the WeChat customer-service account: WeCom admin → My Enterprise → Corp ID (starts with ww).',
+      'field.kfSecret': 'Customer-service secret',
+      'field.kfOpenKfIdHint': 'The customer-service account id (starts with wk), found under WeChat Customer Service → accounts.',
+      'field.kfOpenKfId': 'Customer-service account id',
+      'field.kfPollMs': 'Poll interval (ms)',
+      'console.hook.titleKf': 'WeChat Customer Service',
+      'console.hook.descKf': 'Official API: pull with sync_msg, reply with send_msg. No client, no version dependency — but it only reaches conversations that enter through the service entry.',
       'field.kind.hook': 'Personal WeChat hook',
       'field.hookBaseUrl': 'Hook service URL',
       'field.hookBaseUrlHint': 'The plugin polls this address. gateway/hook-gateway.mjs serves http://127.0.0.1:8788 by default.',
@@ -2103,8 +2121,8 @@ window.__ModuleLoader__.load({
 
         h(Card, { delay: 200 },
           h(CardHead, {
-            title: T('console.hook.title'),
-            sub: T('console.hook.desc'),
+            title: config.kind === 'kf' ? T('console.hook.titleKf') : T('console.hook.title'),
+            sub: config.kind === 'kf' ? T('console.hook.descKf') : T('console.hook.desc'),
             side: h(Pill, { tone: hook.running ? 'on' : undefined },
               hook.running ? T('console.hook.on') : T('console.hook.off')),
           }),
@@ -2186,12 +2204,19 @@ window.__ModuleLoader__.load({
         selfIds: joinList(isRecord(config.hook) ? config.hook.selfIds : []),
       };
       const injectCfg = isRecord(config.inject) ? config.inject : {};
+      const kfCfg = isRecord(config.kf) ? config.kf : {};
+      const kf = {
+        corpId: asText(kfCfg.corpId),
+        corpSecret: '',
+        openKfId: asText(kfCfg.openKfId),
+        pollMs: String(Number(kfCfg.pollMs) || 3000),
+      };
       const inject = {
         injectorPath: asText(injectCfg.injectorPath),
         processName: asText(injectCfg.processName) || 'WeChat.exe',
         hookDll: '',
       };
-      return { reply: reply, gateway: tap, hook: hook, inject: inject };
+      return { reply: reply, gateway: tap, hook: hook, inject: inject, kf: kf };
     }
 
     function SettingsTab(props) {
@@ -2199,6 +2224,7 @@ window.__ModuleLoader__.load({
       const config = isRecord(snap.config) ? snap.config : {};
       const gatewayConfig = isRecord(config.gateway) ? config.gateway : {};
       const hookConfig = isRecord(config.hook) ? config.hook : {};
+      const kfConfig = isRecord(config.kf) ? config.kf : {};
       const presets = asList(snap.presets);
       const override = isRecord(snap.override) ? snap.override : {};
       const overrideCount = Object.keys(override).length;
@@ -2265,6 +2291,17 @@ window.__ModuleLoader__.load({
             else patch['reply.' + key] = asText(value);
             continue;
           }
+          if (group === 'kf') {
+            if (key === 'corpSecret') {
+              if (asText(value).trim() === '') continue;
+              patch['kf.corpSecret'] = asText(value);
+            } else if (key === 'pollMs') {
+              patch['kf.pollMs'] = Math.max(500, Number(value) || 3000);
+            } else {
+              patch['kf.' + key] = asText(value);
+            }
+            continue;
+          }
           if (group === 'inject') {
             if (key === 'hookDll') {
               if (asText(value).trim() === '') continue;
@@ -2321,6 +2358,7 @@ window.__ModuleLoader__.load({
             next.gateway = Object.assign({}, previous.gateway, { sharedSecret: '', appSecret: '', token: '' });
             next.hook = Object.assign({}, previous.hook, { secret: '' });
             next.inject = Object.assign({}, previous.inject, { hookDll: '' });
+            next.kf = Object.assign({}, previous.kf, { corpSecret: '' });
             return next;
           });
           if (typeof props.onSaved === 'function') props.onSaved();
@@ -2359,6 +2397,7 @@ window.__ModuleLoader__.load({
         { id: 'official', label: T('field.kind.official') },
         { id: 'wecom', label: T('field.kind.wecom') },
         { id: 'hook', label: T('field.kind.hook') },
+        { id: 'kf', label: T('field.kind.kf') },
       ];
 
       return h('div', { style: { display: 'flex', flexDirection: 'column', gap: '18px' } },
@@ -2483,6 +2522,40 @@ window.__ModuleLoader__.load({
                 placeholder: gatewayConfig.sharedSecretSet ? T('field.secretPlaceholder') : T('field.secretEmpty'),
                 onChange: function change(event) { setField('gateway', 'sharedSecret', event.target.value); },
               })),
+
+            draft.gateway.kind === 'kf'
+              ? h('div', null,
+                  h(Field, { label: T('field.kfCorpId'), hint: T('field.kfCorpIdHint') },
+                    h('input', {
+                      className: 'wx-input wx-mono',
+                      value: draft.kf.corpId,
+                      placeholder: 'ww1234567890abcdef',
+                      onChange: function change(event) { setField('kf', 'corpId', event.target.value); },
+                    })),
+                  h(Field, { label: T('field.kfSecret') },
+                    h('input', {
+                      className: 'wx-input wx-mono',
+                      type: 'password',
+                      autoComplete: 'off',
+                      value: draft.kf.corpSecret,
+                      placeholder: kfConfig.corpSecretSet ? T('field.secretPlaceholder') : T('field.secretEmpty'),
+                      onChange: function change(event) { setField('kf', 'corpSecret', event.target.value); },
+                    })),
+                  h(Field, { label: T('field.kfOpenKfId'), hint: T('field.kfOpenKfIdHint') },
+                    h('input', {
+                      className: 'wx-input wx-mono',
+                      value: draft.kf.openKfId,
+                      placeholder: 'wk1234567890abcdef',
+                      onChange: function change(event) { setField('kf', 'openKfId', event.target.value); },
+                    })),
+                  h(Field, { label: T('field.kfPollMs') },
+                    h('input', {
+                      className: 'wx-input wx-mono',
+                      value: draft.kf.pollMs,
+                      inputMode: 'numeric',
+                      onChange: function change(event) { setField('kf', 'pollMs', event.target.value.replace(/[^0-9]/g, '')); },
+                    })))
+              : null,
 
             draft.gateway.kind === 'hook'
               ? h('div', null,

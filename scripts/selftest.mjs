@@ -149,6 +149,7 @@ const services = {
 // hook 网关的假实现：测试往 hookInbox 里塞消息，插件轮询时一次性取走
 let hookInbox = []
 let hookCursor = 0
+let kfSyncQueue = []
 globalThis.fetch = async (url, init) => {
   const target = String(url)
   sent.push({ url: target, body: init?.body ? JSON.parse(init.body) : undefined })
@@ -160,6 +161,16 @@ globalThis.fetch = async (url, init) => {
   }
   if (target === 'http://hook.test/send') {
     return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id: 'out-1' }) }
+  }
+  if (target.includes('/cgi-bin/gettoken')) {
+    return { ok: true, status: 200, json: async () => ({ errcode: 0, access_token: 'KF-ACCESS-TOKEN', expires_in: 7200 }) }
+  }
+  if (target.includes('/cgi-bin/kf/sync_msg')) {
+    const batch = kfSyncQueue.shift() ?? { errcode: 0, next_cursor: 'c-kf', has_more: false, msg_list: [] }
+    return { ok: true, status: 200, json: async () => batch }
+  }
+  if (target.includes('/cgi-bin/kf/send_msg')) {
+    return { ok: true, status: 200, json: async () => ({ errcode: 0, errmsg: 'ok' }) }
   }
   return { ok: true, status: 200, text: async () => 'ok', json: async () => ({ errcode: 0 }) }
 }
@@ -801,6 +812,70 @@ await (async () => {
     assert.match(String(auto.detail ?? ''), /client-missing|unsupported-client|dll-missing|没找到|没有公开可用/)
   })
 
+})()
+
+console.log('\n[10] 微信客服（kind=kf，官方 API 拉取/发送）')
+await (async () => {
+  const kfCtx = makeCtx(services)
+  const before = registrations.tools.length
+  apply(kfCtx, {
+    kind: 'kf',
+    kf: { corpId: 'ww-test', corpSecret: 'secret', openKfId: 'wk-test', autoStart: false, limit: 10 },
+    reply: { autoReply: true, mode: 'raw', agentPreset: 'wechat-agent' },
+    stateFile: join(tmpdir(), `wechat-kf-selftest-${process.pid}.json`),
+    debug: false,
+  })
+  const kfTools = registrations.tools.slice(before)
+  const find = (toolName) => kfTools.find((tool) => tool.name === toolName)
+  const run = async (toolName, args = {}) => {
+    const tool = find(toolName)
+    assert.ok(tool, `kf 实例缺少 ${toolName}`)
+    const value = await tool.execute(args, { agent: undefined, signal: new AbortController().signal })
+    const violations = tools.validateJsonSchemaValue(tool.output.schema, value)
+    assert.deepEqual(violations, [], `${toolName} 输出不合 schema`)
+    return value
+  }
+
+  kfSyncQueue = [{
+    errcode: 0,
+    next_cursor: 'c-kf-1',
+    has_more: false,
+    msg_list: [
+      { msgid: 'kf-1', open_kfid: 'wk-test', external_userid: 'wm_user_a', send_time: 1790000000, origin: 3, msgtype: 'text', text: { content: '客服你好' } },
+      { msgid: 'kf-2', open_kfid: 'wk-test', external_userid: 'wm_user_b', send_time: 1790000001, origin: 3, msgtype: 'text', text: { content: '在吗' } },
+      { msgid: 'kf-3', open_kfid: 'wk-test', external_userid: 'wm_user_a', send_time: 1790000002, origin: 3, msgtype: 'image', image: { media_id: 'x' } },
+      { msgid: 'kf-4', open_kfid: 'wk-test', external_userid: 'wm_user_a', send_time: 1790000003, origin: 5, msgtype: 'text', text: { content: '接待人员自己发的' } },
+    ],
+  }]
+
+  const swept = await run('wechat_hook', { action: 'poll' })
+  check('sync_msg 拉取：文本入库、图片与己方消息跳过', () => {
+    assert.equal(swept.ok, true)
+    assert.equal(swept.accepted, 2)
+    assert.equal(swept.skipped, 2)
+    assert.equal(swept.cursor, 'c-kf-1')
+  })
+
+  const chats = await run('wechat_list_chats', {})
+  check('客服会话按 external_userid 建档', () => {
+    const ids = chats.chats.map((chat) => chat.chatId).sort()
+    assert.deepEqual(ids, ['wm_user_a', 'wm_user_b'])
+  })
+
+  const sendResult = await run('wechat_send_message', { chatId: 'wm_user_a', message: '客服回复你' })
+  check('出站打到 kf/send_msg（touser + open_kfid）', () => {
+    assert.equal(sendResult.ok, true)
+    const posted = sent.filter((item) => item.url.includes('/cgi-bin/kf/send_msg'))
+    assert.equal(posted.length, 1)
+    assert.equal(posted[0].body.touser, 'wm_user_a')
+    assert.equal(posted[0].body.open_kfid, 'wk-test')
+    assert.equal(posted[0].body.text.content, '客服回复你')
+  })
+
+  const status = await run('wechat_hook', { action: 'status' })
+  check('wechat_hook status 在 kf 模式下报告 source=kf', () => {
+    assert.equal(status.kind, 'kf')
+  })
 })()
 
 rmSync(OVERRIDE_FILE, { force: true })

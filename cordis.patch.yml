@@ -25,6 +25,13 @@
           token: ''
           # wecom 群机器人 webhook
           wecomWebhook: ''
+        kf:
+          # kind=kf（微信客服官方 API）时生效：sync_msg 拉取 + send_msg 发送
+          corpId: ''
+          corpSecret: ''
+          openKfId: ''
+          pollMs: 3000
+          limit: 100
         inject:
           # 把 hook DLL 注入微信进程（native/build/wechat-inject.exe）
           injectorPath: ./native/build/wechat-inject.exe
@@ -81,7 +88,14 @@
           file: ./persona/wechat-persona.md
           # 自动回复会话的人格由 preset 注入；这里默认关闭以免重复。
           # 用自定义 preset（里面没有 persona 行）时把它改成 true。
-          inject: false
+          kf:
+          # kind=kf（微信客服官方 API）时生效：sync_msg 拉取 + send_msg 发送
+          corpId: ''
+          corpSecret: ''
+          openKfId: ''
+          pollMs: 3000
+          limit: 100
+        inject: false
           # sessions=只注入本插件托管的微信会话；all=插件内全局注册（影响所有会话）
           scope: sessions
         history:

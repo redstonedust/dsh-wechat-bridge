@@ -43,6 +43,7 @@ const DEFAULTS = {
    *   official —— 微信公众平台（XML + 签名验签）
    *   wecom    —— 企业微信群机器人（只出站）
    *   hook     —— 个人微信 hook 服务：插件**主动轮询**收消息、主动 POST 发消息
+   *   kf       —— 微信客服（官方 API）：sync_msg 拉取 + send_msg 发送，不依赖客户端版本
    */
   kind: 'generic',
   webhookPath: '/wechat/webhook',
@@ -58,6 +59,25 @@ const DEFAULTS = {
     token: '',
     /** wecom：群机器人 webhook。 */
     wecomWebhook: '',
+  },
+  kf: {
+    /** 企业微信（管理微信客服的那个）的 corpId / 客服 Secret。 */
+    corpId: '',
+    corpSecret: '',
+    /** 客服账号 id（open_kfid），形如 wkxxxx。 */
+    openKfId: '',
+    /** API 基地址（一般不用改）。 */
+    baseUrl: 'https://qyapi.weixin.qq.com',
+    /** 拉取间隔（毫秒）。 */
+    pollMs: 3000,
+    /** 单次拉取条数（1-1000）。 */
+    limit: 100,
+    /** HTTP 超时。 */
+    timeoutMs: 10000,
+    /** 插件激活即开始拉取。 */
+    autoStart: true,
+    /** 连续失败多少次后暂停（0=永不暂停）。 */
+    maxFailures: 5,
   },
   inject: {
     /** 注入器可执行文件；相对路径按插件包目录解析。.mjs/.js 会用当前 node 跑（便于自测）。 */
@@ -358,6 +378,7 @@ export function apply(ctx, config) {
     lastError: null,
     inject: null,
     detected: null,
+    kf: { cursor: '', pullToken: '' },
   }
 
   const restore = readJson(stateFile)
@@ -370,6 +391,7 @@ export function apply(ctx, config) {
       if (restore.lastError && typeof restore.lastError === 'object') state.lastError = restore.lastError
       if (restore.inject && typeof restore.inject === 'object') state.inject = restore.inject
       if (restore.detected && typeof restore.detected === 'object') state.detected = restore.detected
+      if (restore.kf && typeof restore.kf === 'object') state.kf = { cursor: '', pullToken: '', ...restore.kf }
       state.seq = Number.isSafeInteger(restore.seq) ? restore.seq : 0
     } catch (error) {
       log('warn', `state restore failed: ${error?.message ?? error}`)
@@ -392,6 +414,7 @@ export function apply(ctx, config) {
           lastError: state.lastError,
           inject: state.inject,
           detected: state.detected,
+          kf: kfStatus(),
         }, null, 0))
       } catch (error) {
         log('warn', `state persist failed: ${error?.message ?? error}`)
@@ -515,6 +538,27 @@ export function apply(ctx, config) {
         const payload = await response.json().catch(() => ({}))
         const ok = payload?.errcode === 0
         return { ok, detail: ok ? 'sent' : JSON.stringify(payload) }
+      }
+      // kf：微信客服官方 API（send_msg）
+      if (cfg.kind === 'kf') {
+        if (!cfg.kf.corpId || !cfg.kf.corpSecret || !cfg.kf.openKfId) {
+          return { ok: false, detail: 'kf.corpId / corpSecret / openKfId 未配置' }
+        }
+        try {
+          const token = await wecomToken()
+          const response = await fetch(`${String(cfg.kf.baseUrl).replace(/\/+$/, '')}/cgi-bin/kf/send_msg?access_token=${encodeURIComponent(token)}`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ touser: chatId, open_kfid: cfg.kf.openKfId, msgtype: 'text', text: { content: body } }),
+            signal: AbortSignal.timeout(Math.max(1000, Number(cfg.kf.timeoutMs) || 10000)),
+          })
+          const payload = await response.json().catch(() => ({}))
+          const ok = payload?.errcode === 0
+          if (!ok) log('warn', `kf send_msg rejected: ${JSON.stringify(payload).slice(0, 300)}`)
+          return { ok, detail: ok ? 'sent' : `${payload?.errcode ?? '?'} ${payload?.errmsg ?? ''}`.trim() }
+        } catch (error) {
+          return { ok: false, detail: String(error?.message ?? error).slice(0, 300) }
+        }
       }
       // hook：个人微信 hook 服务（主动 POST）
       if (cfg.kind === 'hook') {
@@ -808,6 +852,186 @@ export function apply(ctx, config) {
     })
     return true
   }
+
+  // ── 微信客服（官方 API）：sync_msg 拉取 + send_msg 发送 ──────────────────
+  // 这条路的优点：不碰客户端、不依赖版本、不用公网回调——就是两个 HTTPS 接口。
+  // 缺点：只能服务从「微信客服」入口进来的会话，聊不到任意微信好友。
+  let kfTokenCache = { value: '', expiresAt: 0 }
+  const wecomBase = () => String(cfg.kf.baseUrl || 'https://qyapi.weixin.qq.com').replace(/\/+$/, '')
+
+  const wecomToken = async () => {
+    if (kfTokenCache.value && Date.now() < kfTokenCache.expiresAt) return kfTokenCache.value
+    const url = `${wecomBase()}/cgi-bin/gettoken?corpid=${encodeURIComponent(cfg.kf.corpId)}&corpsecret=${encodeURIComponent(cfg.kf.corpSecret)}`
+    const response = await fetch(url, { signal: AbortSignal.timeout(Math.max(1000, Number(cfg.kf.timeoutMs) || 10000)) })
+    const payload = await response.json().catch(() => ({}))
+    if (!payload?.access_token) throw new Error(`gettoken failed: ${JSON.stringify(payload).slice(0, 200)}`)
+    kfTokenCache = { value: payload.access_token, expiresAt: Date.now() + Math.max(60, (Number(payload.expires_in) || 7200) - 300) * 1000 }
+    return kfTokenCache.value
+  }
+
+  const kfRuntime = {
+    running: false,
+    paused: false,
+    timer: null,
+    cursor: String(state.kf?.cursor ?? ''),
+    pullToken: String(state.kf?.pullToken ?? ''),
+    seen: new Set(),
+    seenOrder: [],
+    lastPollAt: 0,
+    lastOkAt: 0,
+    failures: 0,
+    lastError: '',
+    pulled: 0,
+    startedAt: 0,
+  }
+
+  const kfReady = () => cfg.kind === 'kf' && Boolean(cfg.kf.corpId && cfg.kf.corpSecret && cfg.kf.openKfId)
+
+  const kfStatus = () => ({
+    kind: cfg.kind,
+    source: 'kf',
+    configured: kfReady(),
+    openKfId: cfg.kf.openKfId ?? '',
+    corpId: cfg.kf.corpId ?? '',
+    secretSet: Boolean(cfg.kf.corpSecret),
+    running: kfRuntime.running,
+    paused: kfRuntime.paused,
+    cursor: kfRuntime.cursor,
+    pollMs: Number(cfg.kf.pollMs) || 3000,
+    lastPollAt: kfRuntime.lastPollAt,
+    lastOkAt: kfRuntime.lastOkAt,
+    failures: kfRuntime.failures,
+    lastError: kfRuntime.lastError,
+    pulled: kfRuntime.pulled,
+    seen: kfRuntime.seen.size,
+    startedAt: kfRuntime.startedAt,
+  })
+
+  const rememberKfMsg = (id) => {
+    if (!id) return false
+    if (kfRuntime.seen.has(id)) return true
+    kfRuntime.seen.add(id)
+    kfRuntime.seenOrder.push(id)
+    if (kfRuntime.seenOrder.length > 1000) {
+      for (const old of kfRuntime.seenOrder.splice(0, kfRuntime.seenOrder.length - 1000)) kfRuntime.seen.delete(old)
+    }
+    return false
+  }
+
+  /** 拉一批（has_more 时最多连拉 5 批，别把一次轮询拖太长）。 */
+  const pollKfOnce = async () => {
+    if (!kfReady()) return { ok: false, detail: 'kind!=kf 或 kf.corpId/corpSecret/openKfId 未配置' }
+    const base = wecomBase()
+    let accepted = 0
+    let skipped = 0
+    let batches = 0
+    kfRuntime.lastPollAt = Date.now()
+    try {
+      const token = await wecomToken()
+      let hasMore = true
+      while (hasMore && batches < 5) {
+        batches += 1
+        const body = { limit: Math.max(1, Math.min(1000, Number(cfg.kf.limit) || 100)) }
+        if (kfRuntime.cursor) body.cursor = kfRuntime.cursor
+        if (kfRuntime.pullToken) body.token = kfRuntime.pullToken
+        const response = await fetch(`${base}/cgi-bin/kf/sync_msg?access_token=${encodeURIComponent(token)}`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(Math.max(1000, Number(cfg.kf.timeoutMs) || 10000)),
+        })
+        const payload = await response.json().catch(() => ({}))
+        if (payload?.errcode !== 0) throw new Error(`sync_msg ${payload?.errcode ?? '?'}: ${payload?.errmsg ?? 'unknown'}`)
+        for (const message of payload.msg_list ?? []) {
+          const id = String(message.msgid ?? '')
+          if (id && rememberKfMsg(id)) { skipped += 1; continue }
+          if (message.origin === 5) { skipped += 1; continue } // 5 = 由接待人员/系统发出，忽略
+          if (message.msgtype !== 'text') { skipped += 1; continue }
+          const chatId = String(message.external_userid ?? '')
+          if (!chatId) { skipped += 1; continue }
+          const ok = dispatchInbound({
+            chatId,
+            chatName: chatId,
+            kind: 'private',
+            senderId: chatId,
+            senderName: chatId,
+            text: String(message.text?.content ?? ''),
+            messageId: id,
+            time: Number(message.send_time) > 0 ? Number(message.send_time) * 1000 : undefined,
+          })
+          if (ok) accepted += 1
+          else skipped += 1
+        }
+        if (payload.next_cursor) kfRuntime.cursor = String(payload.next_cursor)
+        if (payload.token !== undefined) kfRuntime.pullToken = String(payload.token ?? '')
+        hasMore = payload.has_more === true
+      }
+    } catch (error) {
+      kfRuntime.failures += 1
+      kfRuntime.lastError = String(error?.message ?? error).slice(0, 300)
+      state.counters.errors += 1
+      log('warn', `kf sync_msg failed (${kfRuntime.failures}): ${kfRuntime.lastError}`)
+      const maxFailures = Number(cfg.kf.maxFailures) || 0
+      if (maxFailures > 0 && kfRuntime.failures >= maxFailures) {
+        kfRuntime.paused = true
+        log('warn', `kf 拉取连续失败 ${kfRuntime.failures} 次，已暂停`)
+      }
+      return { ok: false, detail: kfRuntime.lastError, failures: kfRuntime.failures }
+    }
+    kfRuntime.failures = 0
+    kfRuntime.paused = false
+    kfRuntime.lastOkAt = Date.now()
+    kfRuntime.lastError = ''
+    kfRuntime.pulled += accepted
+    state.kf = { cursor: kfRuntime.cursor, pullToken: kfRuntime.pullToken }
+    persist()
+    return { ok: true, cursor: kfRuntime.cursor, accepted, skipped, batches }
+  }
+
+  const scheduleKf = (delay) => {
+    if (kfRuntime.timer) { clearTimeout(kfRuntime.timer); kfRuntime.timer = null }
+    if (!kfRuntime.running) return
+    const wait = Math.max(300, Number(delay ?? cfg.kf.pollMs) || 3000)
+    kfRuntime.timer = setTimeout(() => {
+      kfRuntime.timer = null
+      void (async () => {
+        const result = await pollKfOnce()
+        if (!kfRuntime.running) return
+        if (result.ok) scheduleKf(cfg.kf.pollMs)
+        else if (!kfRuntime.paused) {
+          scheduleKf(Math.min(60000, (Number(cfg.kf.pollMs) || 3000) * 2 ** Math.min(kfRuntime.failures, 4)))
+        }
+      })()
+    }, wait)
+    if (typeof kfRuntime.timer.unref === 'function') kfRuntime.timer.unref()
+  }
+
+  const startKf = () => {
+    if (!kfReady()) return { ok: false, detail: 'kind!=kf 或 kf 凭据未配置' }
+    const resuming = kfRuntime.running && kfRuntime.paused
+    if (kfRuntime.running && !resuming) return { ok: true, running: true, detail: '已在拉取' }
+    kfRuntime.running = true
+    kfRuntime.paused = false
+    kfRuntime.failures = 0
+    kfRuntime.lastError = ''
+    if (!kfRuntime.startedAt) kfRuntime.startedAt = Date.now()
+    scheduleKf(0)
+    log('info', `${resuming ? '已恢复' : '已启动'} 微信客服拉取`)
+    return { ok: true, running: true, cursor: kfRuntime.cursor, ...(resuming ? { resumed: true, detail: '已恢复拉取' } : { detail: '已启动拉取' }) }
+  }
+
+  const stopKf = () => {
+    kfRuntime.running = false
+    if (kfRuntime.timer) { clearTimeout(kfRuntime.timer); kfRuntime.timer = null }
+    return { ok: true, running: false }
+  }
+
+  // ── 统一入口：hook 与 kf 共用一套「轮询器」按钮/工具 ────────────────────
+  const pollerShift = () => cfg.kind === 'kf'
+  const pollerStatus = () => (pollerShift() ? kfStatus() : hookStatus())
+  const pollerStart = () => (pollerShift() ? startKf() : startHook())
+  const pollerStop = () => (pollerShift() ? stopKf() : stopHook())
+  const pollerPoll = () => (pollerShift() ? pollKfOnce() : pollHookOnce())
 
   //  个人微信 hook：主动轮询 + 主动发送
   // ────────────────────────────────────────────────────────────────────────
@@ -1149,6 +1373,16 @@ export function apply(ctx, config) {
     return { ok: true, running: false }
   }
 
+  const resetKfCursor = (cursor) => {
+    kfRuntime.cursor = String(cursor ?? '')
+    kfRuntime.pullToken = ''
+    kfRuntime.failures = 0
+    kfRuntime.paused = false
+    state.kf = { cursor: kfRuntime.cursor, pullToken: '' }
+    persist()
+    return { ok: true, cursor: kfRuntime.cursor }
+  }
+
   const resetHookCursor = (cursor) => {
     hookRuntime.cursor = String(cursor ?? '')
     cfg.hook.cursor = hookRuntime.cursor
@@ -1159,8 +1393,9 @@ export function apply(ctx, config) {
 
   ctx.effect(() => {
     if (cfg.kind === 'hook' && cfg.hook.autoStart && cfg.hook.baseUrl) startHook()
-    return () => { stopHook() }
-  }, 'wechat-bridge.hookPoller()')
+    if (cfg.kind === 'kf' && cfg.kf.autoStart && cfg.kf.corpId && cfg.kf.corpSecret && cfg.kf.openKfId) startKf()
+    return () => { stopHook(); stopKf() }
+  }, 'wechat-bridge.poller()')
 
   // ── HTTP 路由 ───────────────────────────────────────────────────────────
   const path = cfg.webhookPath.startsWith('/') ? cfg.webhookPath : `/${cfg.webhookPath}`
@@ -1203,7 +1438,26 @@ export function apply(ctx, config) {
         maxMessages: cfg.history.maxMessages,
         debug: cfg.debug,
         // hook 配置同样只回「是否已设置」
-        inject: {
+        kf: {
+    /** 企业微信（管理微信客服的那个）的 corpId / 客服 Secret。 */
+    corpId: '',
+    corpSecret: '',
+    /** 客服账号 id（open_kfid），形如 wkxxxx。 */
+    openKfId: '',
+    /** API 基地址（一般不用改）。 */
+    baseUrl: 'https://qyapi.weixin.qq.com',
+    /** 拉取间隔（毫秒）。 */
+    pollMs: 3000,
+    /** 单次拉取条数（1-1000）。 */
+    limit: 100,
+    /** HTTP 超时。 */
+    timeoutMs: 10000,
+    /** 插件激活即开始拉取。 */
+    autoStart: true,
+    /** 连续失败多少次后暂停（0=永不暂停）。 */
+    maxFailures: 5,
+  },
+  inject: {
           injectorPath: cfg.inject.injectorPath ?? '',
           processName: cfg.inject.processName ?? '',
           hookDll: cfg.inject.hookDll ?? '',
@@ -1228,7 +1482,7 @@ export function apply(ctx, config) {
         },
       },
       autoReply: !autoReplyOff,
-      hook: hookStatus(),
+      hook: pollerStatus(),
       inject: injectStatus(),
       agentServices: Boolean(agentApi),
       presets: presets.list,
@@ -1372,11 +1626,11 @@ export function apply(ctx, config) {
     },
 
     /* ── 个人微信 hook ── */
-    hookStatus: () => hookStatus(),
-    hookStart: () => startHook(),
-    hookStop: () => stopHook(),
-    hookPoll: () => pollHookOnce(),
-    hookResetCursor: (cursor) => resetHookCursor(cursor),
+    hookStatus: () => pollerStatus(),
+    hookStart: () => pollerStart(),
+    hookStop: () => pollerStop(),
+    hookPoll: () => pollerPoll(),
+    hookResetCursor: (cursor) => (pollerShift() ? resetKfCursor(cursor) : resetHookCursor(cursor)),
     injectStatus: () => injectStatus(),
     injectWechat: () => injectWechat(),
 
@@ -1510,6 +1764,7 @@ export function apply(ctx, config) {
           lastError: state.lastError,
           inject: state.inject,
           detected: state.detected,
+          kf: kfStatus(),
           persona: { injected: Boolean(personaText), chars: personaText.length },
         })
       },
@@ -2119,9 +2374,9 @@ export function apply(ctx, config) {
     },
     execute: async (args) => {
       const action = String(args?.action ?? 'status')
-      const base = { action, kind: cfg.kind, running: hookRuntime.running, paused: hookRuntime.paused }
+      const base = { action, kind: cfg.kind, running: pollerStatus().running, paused: pollerStatus().paused }
       if (action === 'status') {
-        const status = hookStatus()
+        const status = pollerStatus()
         return {
           ok: true,
           ...base,
@@ -2134,11 +2389,11 @@ export function apply(ctx, config) {
         }
       }
       if (action === 'start') {
-        const outcome = startHook()
-        return { ok: outcome.ok !== false, ...base, running: hookRuntime.running, ...(outcome.cursor ? { cursor: outcome.cursor } : {}), ...(outcome.detail ? { detail: outcome.detail } : {}) }
+        const outcome = pollerStart()
+        return { ok: outcome.ok !== false, ...base, running: pollerStatus().running, ...(outcome.cursor ? { cursor: outcome.cursor } : {}), ...(outcome.detail ? { detail: outcome.detail } : {}) }
       }
       if (action === 'stop') {
-        stopHook()
+        pollerStop()
         return { ok: true, ...base, running: false }
       }
       if (action === 'inject') {
@@ -2152,10 +2407,10 @@ export function apply(ctx, config) {
         }
       }
       if (action === 'reset-cursor') {
-        const outcome = resetHookCursor(args?.cursor)
+        const outcome = pollerShift() ? resetKfCursor(args?.cursor) : resetHookCursor(args?.cursor)
         return { ok: true, ...base, cursor: outcome.cursor }
       }
-      const outcome = await pollHookOnce()
+      const outcome = await pollerPoll()
       return {
         ok: outcome.ok !== false,
         ...base,

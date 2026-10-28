@@ -56,6 +56,37 @@ node gateway/hook-gateway.mjs --driver exec --port 8788 --secret change-me `
 细节（游标语义、字段映射、wcf 路径/方法名适配）见 [gateway/README.md](gateway/README.md)。
 面板「控制台 → 个人微信 Hook」可以看游标/最近错误、手动拉一次、随时开关轮询。
 
+### 除了 hook，还有哪些接入方式
+
+| 方案 | 本插件 | 覆盖场景 | 依赖 | 稳定性 | 风险 |
+|---|---|---|---|---|---|
+| **微信客服（官方 API）** | `kind: kf` | 从"微信客服"入口进来的用户 | 企业微信 corpId + 客服 Secret + open_kfid | 高（官方接口，`sync_msg` 拉取 + `send_msg`） | 无（需企业主体） |
+| 公众号 | `kind: official` | 关注公众号的用户 | appId/appSecret/token + 公网 HTTPS | 高 | 客服消息 48h 窗口 |
+| 企业微信群机器人 | `kind: wecom` | 群通知 | 群机器人 webhook | 高 | 只出站 |
+| 自建网关（generic） | `kind: generic` | 任意，看网关实现 | 你自己的网关 | 取决于实现 | 取决于实现 |
+| **个人微信 hook** | `kind: hook` | 任意好友/群 | WeChat 3.9.x + 匹配 DLL | 中（客户端版本绑定） | 版本不匹配会崩 |
+| 第三方 iPad/网页协议 | 接 `generic` | 任意 | 第三方服务商 | 中 | 账号风险、服务方跑路 |
+| Android 无障碍 / 通知转发 | 接 `generic` | 手机端 | 一台常开的安卓机 | 中低 | 只能拿通知摘要 |
+| UI Automation / OCR | ✗ | — | — | 低 | 4.x Qt 自绘无法定位控件 |
+| 本地数据库解密 | ✗ | — | — | 低 | 4.x 密钥在内存里，绕不开 hook |
+
+> 这台机器（Weixin 4.2.0.9）能用的只有前四行 + 手机/第三方那两条外挂路；hook 与 UIA 都不可行。
+
+**微信客服怎么配**（不用客户端、不用公网回调）：
+
+```yaml
+config:
+  kind: kf
+  kf:
+    corpId: 'ww1234567890abcdef'      # 企业微信 → 我的企业 → 企业 ID
+    corpSecret: '<客服 Secret>'        # 微信客服 → 开发配置 → Secret
+    openKfId: 'wk1234567890abcdef'    # 微信客服 → 客服账号
+    pollMs: 3000
+```
+
+拿凭据的三步：企业微信管理后台 →「微信客服」→ 开一个客服账号（得到 `open_kfid`）→「开发配置」里拿 Secret；
+企业 ID 在「我的企业」。然后插件用 `sync_msg` 游标拉取、`send_msg` 回复，和 hook 一样有游标/去重/暂停/面板按钮。
+
 ### 一键接入：探测 → 选 DLL → 注入 → 起网关 → 写配置 → 自检
 
 ```powershell
